@@ -13,7 +13,10 @@ fi
 
 parse_edge_entry "$1"
 
+EDGE_K0S_DATA_DIR="${EDGE_K0S_DATA_DIR:-/data/k0s}"
+
 echo "=== 06: Installing k0s worker on ${NODE_IP} for ${CLUSTER_NAME} ==="
+echo "k0s worker data dir: ${EDGE_K0S_DATA_DIR}"
 
 # Test SSH
 ssh ${SSH_KEY_OPT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${EDGE_SSH}" "hostname" || {
@@ -115,16 +118,19 @@ ssh ${SSH_KEY_OPT} "${EDGE_SSH}" \
 scp ${SSH_KEY_OPT} "${REPO_DIR}/join-token-${CLUSTER_NAME}" "${EDGE_SSH}:/tmp/join-token"
 
 # Install and start worker
-ssh ${SSH_KEY_OPT} "${EDGE_SSH}" bash -s <<'WORKER_SCRIPT'
+ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "EDGE_K0S_DATA_DIR='${EDGE_K0S_DATA_DIR}' bash -s" <<'WORKER_SCRIPT'
 set -euo pipefail
 command -v k0s &>/dev/null || { curl -sSLf https://get.k0s.sh | sudo sh; }
 echo "k0s: $(k0s version)"
 if ! sudo systemctl is-active k0sworker &>/dev/null; then
-    sudo mkdir -p /etc/k0s
+    sudo mkdir -p /etc/k0s "$EDGE_K0S_DATA_DIR"
     sudo cp /tmp/join-token /etc/k0s/join-token
     sudo chmod 600 /etc/k0s/join-token
     rm -f /tmp/join-token
-    sudo k0s install worker --force --token-file /etc/k0s/join-token
+    sudo k0s install worker --force \
+        --data-dir "$EDGE_K0S_DATA_DIR" \
+        --kubelet-root-dir "$EDGE_K0S_DATA_DIR/kubelet" \
+        --token-file /etc/k0s/join-token
     sudo systemctl reset-failed k0sworker 2>/dev/null || true
     sudo k0s start
 fi

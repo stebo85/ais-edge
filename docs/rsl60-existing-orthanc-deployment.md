@@ -27,9 +27,10 @@ export EDGE_JOIN_MODE="manual"
 export AIS_EDGE_NO_SSH="1"
 export EDGE_ORTHANC_MODE="external"
 export EDGE_ORTHANC_URL="http://<rsl60-orthanc-api-host-or-ip>:8042"
-export EDGE_DATA_HOST_PATH="/data/xnat-ingest"
-export EDGE_ORTHANC_STORAGE_HOST_PATH="/data/xnat-ingest/orthanc-storage"
+export EDGE_DATA_HOST_PATH="/local/ais-edge/xnat-ingest"
+export EDGE_ORTHANC_STORAGE_HOST_PATH="/local/ais-edge/xnat-ingest/orthanc-storage"
 export EDGE_ORTHANC_STORAGE_DIR="/data/orthanc-storage"
+export EDGE_K0S_DATA_DIR="/data/k0s"
 ```
 
 The existing Orthanc storage must be visible to the sort pod at
@@ -37,12 +38,21 @@ The existing Orthanc storage must be visible to the sort pod at
 Orthanc storage on `rsl60` to:
 
 ```bash
-/data/xnat-ingest/orthanc-storage
+/local/ais-edge/xnat-ingest/orthanc-storage
 ```
 
 Keep staging and Orthanc storage on the same filesystem. `xnat-ingest sort`
 hardlinks from Orthanc storage into staging, and cross-filesystem hardlinks
 fail with `EXDEV`.
+
+On the current rsl60 host, Orthanc stores DICOM data under
+`/local/orthanc/db-v6`, while `/data` is a separate filesystem. Use `/local`
+for `EDGE_DATA_HOST_PATH` and the bind mount above, and use `/data/k0s` only
+for k0s/container runtime state.
+
+If the existing Orthanc REST API requires HTTP Basic Auth, include credentials
+in `EDGE_ORTHANC_URL` using a secret-managed config file on the management
+host, for example `http://<user>:<pass>@<rsl60-host>:8042`.
 
 ## Management-Side Steps
 

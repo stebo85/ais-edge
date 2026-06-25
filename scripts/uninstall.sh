@@ -43,6 +43,7 @@ for entry in "${EDGE_NODES[@]}"; do
 sudo k0s stop 2>/dev/null || true
 sudo k0s reset 2>/dev/null || true
 sudo rm -rf /data/xnat-ingest 2>/dev/null || true
+sudo rm -rf "${EDGE_K0S_DATA_DIR:-/data/k0s}" 2>/dev/null || true
 sudo rm -f /etc/k0s/join-token 2>/dev/null || true
 # Phase 2: drop the /etc/hosts block we added in 06
 sudo sed -i '/# ais-edge phase2 tls hostnames/,+1d' /etc/hosts 2>/dev/null || true
