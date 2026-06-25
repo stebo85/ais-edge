@@ -39,8 +39,10 @@ require_file haproxy/server.pem
 EDGE_DATA_HOST_PATH="${EDGE_DATA_HOST_PATH:-/data/xnat-ingest}"
 EDGE_ORTHANC_MODE="${EDGE_ORTHANC_MODE:-managed}"
 EDGE_ORTHANC_STORAGE_HOST_PATH="${EDGE_ORTHANC_STORAGE_HOST_PATH:-${EDGE_DATA_HOST_PATH}/orthanc-storage}"
+EDGE_K0S_DATA_DIR="${EDGE_K0S_DATA_DIR:-/data/k0s}"
 
 echo "=== AIS Edge local bootstrap: ${CLUSTER_NAME:-unknown} ==="
+echo "k0s worker data dir: ${EDGE_K0S_DATA_DIR}"
 
 if [ "${INSTALL_TOPOLOGY:-onprem}" = "onprem" ]; then
     HOSTS_MARKER="# ais-edge phase2 tls hostnames"
@@ -59,7 +61,7 @@ ${SUDO} install -m 0644 haproxy/ca.crt /etc/haproxy/certs/ca.crt
 ${SUDO} install -m 0644 haproxy/server.pem /etc/haproxy/certs/server.pem
 
 echo "Installing k0s join token..."
-${SUDO} mkdir -p /etc/k0s
+${SUDO} mkdir -p /etc/k0s "${EDGE_K0S_DATA_DIR}"
 ${SUDO} install -m 0600 join-token /etc/k0s/join-token
 
 if [ -f ais-edge-ca.crt ]; then
@@ -104,7 +106,10 @@ echo "k0s: $(k0s version)"
 
 if ! ${SUDO} systemctl is-active k0sworker >/dev/null 2>&1; then
     echo "Installing and starting k0s worker..."
-    ${SUDO} k0s install worker --force --token-file /etc/k0s/join-token
+    ${SUDO} k0s install worker --force \
+        --data-dir "${EDGE_K0S_DATA_DIR}" \
+        --kubelet-root-dir "${EDGE_K0S_DATA_DIR}/kubelet" \
+        --token-file /etc/k0s/join-token
     ${SUDO} systemctl reset-failed k0sworker 2>/dev/null || true
     ${SUDO} k0s start
 else

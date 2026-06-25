@@ -1,21 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Step 06: Join an edge worker over SSH   (edges[].join: ssh — the default)
+# Step 06: Install k0s worker on edge VM and join the hosted cluster
 #          Usage: ./06-join-edge-worker.sh <edge-entry>
-# =============================================================================
-# This is the DELIVERY half of joining a worker. The join itself lives in
-# scripts/files/edge-join.sh and runs on the edge; this script only gets that
-# script and its three files onto the machine and runs them.
-#
-# The other delivery half is scripts/06b-make-bootstrap.sh, for sites where the
-# management node has no inbound path to the edge at all (whitelisted IPs, VPN,
-# GlobalProtect). Both push the SAME join script, so a bundle-joined edge and an
-# ssh-joined edge are configured identically — see the note at the top of
-# scripts/files/edge-join.sh for why that matters, and
-# scripts/ci/runtime-templates.sh for the assertion that keeps it true.
-#
-# Management-side work that follows the join is scripts/06c-post-join.sh, shared
-# for the same reason.
 # =============================================================================
 set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/00-common.sh"
@@ -25,105 +11,203 @@ if [ $# -lt 1 ]; then
     exit 1
 fi
 
-# Configuration comes from sites/<site>/values.yaml, exported by install.sh.
-# There is no second source: the `else parse_edge_entry "$1"` branch that used
-# to sit here read config/edge-nodes.env, which could contradict the site file
-# the charts were rendered from.
-: "${CLUSTER_NAME:?install.sh must export CLUSTER_NAME}"
-# `~` is expanded explicitly: it comes from a YAML value, so the shell never
-# sees it in a position where tilde expansion happens, and ssh would be handed
-# a literal "~/.ssh/id_ed25519" that does not exist.
-SSH_KEY="${SSH_KEY/#\~/$HOME}"
-EDGE_SSH="${SSH_USER}@${NODE_IP}"
-SSH_KEY_OPT=""
-[ -n "${SSH_KEY:-}" ] && SSH_KEY_OPT="-i ${SSH_KEY}"
-EDGE_KC="${REPO_DIR}/kubeconfig-${CLUSTER_NAME}"
+parse_edge_entry "$1"
 
-# THE WORKER MUST RUN THE SAME k0s AS ITS CONTROL PLANE — on THIS path too.
-#
-# The bundle path (06b) reads this from the Cluster CR and exports it. This
-# path did not, so edge-join.sh fell through to its unpinned branch and the
-# DEFAULT join mode kept the bug the bundle path had just been fixed for: a
-# worker one minor ahead of its control plane bootstraps, gets its CSR
-# approved, then asks for a `worker-config-default-<its minor>` ConfigMap the
-# control plane never created. The Node authorizer denies it, k0s exits 1, and
-# systemd restarts it forever while the node never appears.
-#
-# Same source as 06b: the Cluster CR is what k0smotron actually built the
-# control plane from, so it cannot drift from what is running.
-K0S_VERSION="$(kubectl get cluster.k0smotron.io -n "$CLUSTER_NAME" "$CLUSTER_NAME" \
-    -o jsonpath='{.spec.version}' 2>/dev/null || true)"
-if [ -z "$K0S_VERSION" ]; then
-    echo "ERROR: cannot read .spec.version from cluster.k0smotron.io/${CLUSTER_NAME}" >&2
-    echo "       Refusing to join a worker without pinning it to the control" >&2
-    echo "       plane's version — an unpinned worker crash-loops on a missing" >&2
-    echo "       worker-config ConfigMap when upstream has moved on." >&2
-    exit 1
-fi
-echo "  k0s version (from the Cluster CR): ${K0S_VERSION}"
+EDGE_K0S_DATA_DIR="${EDGE_K0S_DATA_DIR:-/data/k0s}"
 
 echo "=== 06: Installing k0s worker on ${NODE_IP} for ${CLUSTER_NAME} ==="
+echo "k0s worker data dir: ${EDGE_K0S_DATA_DIR}"
 
+# Test SSH
 ssh ${SSH_KEY_OPT} -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "${EDGE_SSH}" "hostname" || {
-    echo "ERROR: Cannot SSH to ${EDGE_SSH}"
-    echo "       If this site has no inbound path from here, set join: bundle on its"
-    echo "       edges[] entry and the installer will produce a carry-over bundle instead."
-    exit 1
+    echo "ERROR: Cannot SSH to ${EDGE_SSH}"; exit 1;
 }
 
-# The three files the edge needs, built by the same function the bundle path
-# uses so the two cannot diverge on cert generation.
-STAGE="$(mktemp -d)"
-trap 'find "$STAGE" -type f -exec shred -u {} + 2>/dev/null || true; rm -rf "$STAGE"' EXIT
-stage_edge_join_payload "$STAGE"
-
-# ASK THE CHILD CLUSTER, not the edge's systemd, whether this node is joined.
-# A worker whose unit is merely `active` may be holding a token or a kubelet
-# certificate the rebuilt control plane refuses ("the server has asked for the
-# client to provide credentials"), and a guard keyed on `is-active` made that
-# state permanent — the join was skipped on every subsequent run, so the node
-# could never be repaired by re-running the installer.
+# On-prem topology: ensure /etc/hosts on the edge VM resolves the TLS
+# hostnames to the management node. Idempotent — the marker comment is what
+# we grep for to avoid duplicate entries on re-runs.
 #
-# edge-join.sh can work this out for itself when it has to (the bundle path,
-# where the edge cannot see the child cluster), but the answer from here is
-# authoritative, so pass it.
-NODE_JOINED=false
-if KUBECONFIG="$EDGE_KC" kubectl get nodes --no-headers 2>/dev/null | grep -q ' Ready'; then
-    NODE_JOINED=true
+# Cloud topology: skipped — edges resolve via real public DNS (nip.io for
+# dev, a registered domain for prod). The hostAliases block in pod manifests
+# is similarly stripped by render_with_topology.
+if [ "${INSTALL_TOPOLOGY:-onprem}" = "onprem" ]; then
+    HOSTS_LINE="${MGMT_NODE_IP} ${SEAWEEDFS_HOSTNAME} ${K0S_API_HOSTNAME} ${KONNECTIVITY_HOSTNAME}"
+    HOSTS_MARKER="# ais-edge phase2 tls hostnames"
+    echo "Ensuring /etc/hosts on edge has the TLS hostnames..."
+    ssh ${SSH_KEY_OPT} "${EDGE_SSH}" \
+        "grep -qF '${HOSTS_MARKER}' /etc/hosts || \
+         echo -e '${HOSTS_MARKER}\n${HOSTS_LINE}' | sudo tee -a /etc/hosts >/dev/null"
+    ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "grep -A1 '${HOSTS_MARKER}' /etc/hosts | tail -2"
+else
+    echo "Cloud topology — skipping /etc/hosts edit. Edge resolves SNI hostnames"
+    echo "  (${SEAWEEDFS_HOSTNAME} / ${K0S_API_HOSTNAME} / ${KONNECTIVITY_HOSTNAME})"
+    echo "  via real public DNS pointing at LB_PUBLIC_IP=${LB_PUBLIC_IP:-<unset>}."
 fi
-echo "  already joined and Ready: ${NODE_JOINED}"
 
-REMOTE_DIR="/tmp/ais-join-$$"
-ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "mkdir -p ${REMOTE_DIR} && chmod 0700 ${REMOTE_DIR}"
-scp -q ${SSH_KEY_OPT} \
-    "${STAGE}/k0s-ca.crt" "${STAGE}/haproxy-server.pem" "${STAGE}/join-token" \
-    "${REPO_DIR}/scripts/files/edge-join.sh" \
-    "${EDGE_SSH}:${REMOTE_DIR}/"
+# Phase 2: pre-stage certs for the k0smotron-haproxy DaemonSet that runs on
+# the worker. With spec.ingress, k0smotron pushes a haproxy DS (hostNetwork)
+# that exposes 127.0.0.1:7443 as a local TLS endpoint forwarding to the
+# nginx-ingress on the management node. It expects:
+#   /etc/haproxy/certs/server.pem  — frontend cert+key the haproxy serves
+#       to in-cluster clients (kube-router, etc). It MUST be signed by the
+#       cluster's internal k0s CA so workload pods trust it via their
+#       projected serviceaccount ca.crt — without this, every pod that
+#       calls the kubernetes Service hits "x509: certificate signed by
+#       unknown authority".
+#   /etc/haproxy/certs/ca.crt      — CA cert haproxy uses to verify the
+#       upstream k0s API (the same internal k0s CA).
+HAPROXY_CA=$(mktemp /tmp/k0s-ca-XXXXXX.crt)
+HAPROXY_CAKEY=$(mktemp /tmp/k0s-cakey-XXXXXX.key)
+HAPROXY_KEY=$(mktemp /tmp/haproxy-srv-XXXXXX.key)
+HAPROXY_CSR=$(mktemp /tmp/haproxy-srv-XXXXXX.csr)
+HAPROXY_CRT=$(mktemp /tmp/haproxy-srv-XXXXXX.crt)
+HAPROXY_PEM=$(mktemp /tmp/haproxy-srv-XXXXXX.pem)
+HAPROXY_CONF=$(mktemp /tmp/haproxy-srv-XXXXXX.cnf)
+cleanup_haproxy_tmp() {
+    rm -f "$HAPROXY_CA" "$HAPROXY_CAKEY" "$HAPROXY_KEY" "$HAPROXY_CSR" \
+          "$HAPROXY_CRT" "$HAPROXY_PEM" "$HAPROXY_CONF"
+}
+trap cleanup_haproxy_tmp EXIT
 
-# EVERY VALUE GOES THROUGH printf %q. ssh does not take an argv: it joins its
-# arguments into ONE string that the REMOTE shell re-splits on whitespace, so
-# `ssh host VAR="a b" cmd` assigns only "a" and runs "b" as the command. That
-# broke the kubelet log-rotation flags here and left the worker uninstalled
-# while the error named a stray k0s argument.
+# Extract the k0s internal CA cert + key from the management cluster.
+# Secret name is "<clusterName>-ca" in the cluster's namespace, with keys
+# tls.crt / tls.key. (k0smotron generates this CA per Cluster CR.)
+kubectl get secret -n "${CLUSTER_NAME}" "${CLUSTER_NAME}-ca" \
+    -o jsonpath='{.data.tls\.crt}' | base64 -d > "$HAPROXY_CA"
+kubectl get secret -n "${CLUSTER_NAME}" "${CLUSTER_NAME}-ca" \
+    -o jsonpath='{.data.tls\.key}' | base64 -d > "$HAPROXY_CAKEY"
+
+# Generate a server cert signed by the cluster CA. SANs cover everything
+# that might TLS-dial the local haproxy from inside the child cluster.
+cat > "$HAPROXY_CONF" <<EOF
+[req]
+distinguished_name=req
+req_extensions=v3_req
+[v3_req]
+subjectAltName=@alt
+[alt]
+DNS.1=localhost
+DNS.2=kubernetes
+DNS.3=kubernetes.default
+DNS.4=kubernetes.default.svc
+DNS.5=kubernetes.default.svc.cluster.local
+IP.1=127.0.0.1
+IP.2=10.96.0.1
+IP.3=${NODE_IP}
+EOF
+openssl genrsa -out "$HAPROXY_KEY" 2048 2>/dev/null
+openssl req -new -key "$HAPROXY_KEY" -subj "/CN=k0smotron-haproxy" \
+    -out "$HAPROXY_CSR" -config "$HAPROXY_CONF" 2>/dev/null
+openssl x509 -req -in "$HAPROXY_CSR" -CA "$HAPROXY_CA" -CAkey "$HAPROXY_CAKEY" \
+    -CAcreateserial -out "$HAPROXY_CRT" -days 3650 \
+    -extensions v3_req -extfile "$HAPROXY_CONF" 2>/dev/null
+cat "$HAPROXY_CRT" "$HAPROXY_KEY" > "$HAPROXY_PEM"
+
+# Push to edge (hostPath /etc/haproxy/certs/, root:root, 0644 — haproxy
+# container runs as non-root and must read these).
+echo "Staging k0smotron-haproxy certs on edge (signed by cluster CA)..."
+ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "sudo mkdir -p /etc/haproxy/certs && sudo chmod 0755 /etc/haproxy/certs"
+scp -q ${SSH_KEY_OPT} "$HAPROXY_CA"  "${EDGE_SSH}:/tmp/k0s-ca.crt"
+scp -q ${SSH_KEY_OPT} "$HAPROXY_PEM" "${EDGE_SSH}:/tmp/haproxy-server.pem"
 ssh ${SSH_KEY_OPT} "${EDGE_SSH}" \
-    "EDGE_NAME=$(printf '%q' "$CLUSTER_NAME") \
-     MGMT_NODE_IP=$(printf '%q' "${MGMT_NODE_IP:-}") \
-     SEAWEEDFS_HOSTNAME=$(printf '%q' "${SEAWEEDFS_HOSTNAME:-}") \
-     K0S_API_HOSTNAME=$(printf '%q' "${K0S_API_HOSTNAME:-}") \
-     KONNECTIVITY_HOSTNAME=$(printf '%q' "${KONNECTIVITY_HOSTNAME:-}") \
-     KUBELET_EXTRA_ARGS=$(printf '%q' "--container-log-max-size=${KUBELET_LOG_MAX_SIZE:-10Mi} --container-log-max-files=${KUBELET_LOG_MAX_FILES:-5}") \
-     INSTALL_TOPOLOGY=$(printf '%q' "${INSTALL_TOPOLOGY:-onprem}") \
-     NODE_JOINED=$(printf '%q' "$NODE_JOINED") \
-     AIS_STAGE_DIR=$(printf '%q' "$REMOTE_DIR") \
-     K0S_VERSION=$(printf '%q' "$K0S_VERSION") \
-     bash ${REMOTE_DIR}/edge-join.sh"
+    "sudo install -m 0644 /tmp/k0s-ca.crt /etc/haproxy/certs/ca.crt && \
+     sudo install -m 0644 /tmp/haproxy-server.pem /etc/haproxy/certs/server.pem && \
+     sudo rm -f /tmp/k0s-ca.crt /tmp/haproxy-server.pem"
 
-# The token is shredded by edge-join.sh; remove what is left of the directory.
-ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "rm -rf ${REMOTE_DIR}" 2>/dev/null || true
+# Copy join token
+scp ${SSH_KEY_OPT} "${REPO_DIR}/join-token-${CLUSTER_NAME}" "${EDGE_SSH}:/tmp/join-token"
 
-# Node verification and the child-cluster CoreDNS patch are management-side and
-# identical for both delivery paths.
-WAIT_MINUTES="${WAIT_MINUTES:-3}" \
-    bash "${REPO_DIR}/scripts/06c-post-join.sh" "$CLUSTER_NAME"
+# Install and start worker
+ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "EDGE_K0S_DATA_DIR='${EDGE_K0S_DATA_DIR}' bash -s" <<'WORKER_SCRIPT'
+set -euo pipefail
+command -v k0s &>/dev/null || { curl -sSLf https://get.k0s.sh | sudo sh; }
+echo "k0s: $(k0s version)"
+if ! sudo systemctl is-active k0sworker &>/dev/null; then
+    sudo mkdir -p /etc/k0s "$EDGE_K0S_DATA_DIR"
+    sudo cp /tmp/join-token /etc/k0s/join-token
+    sudo chmod 600 /etc/k0s/join-token
+    rm -f /tmp/join-token
+    sudo k0s install worker --force \
+        --data-dir "$EDGE_K0S_DATA_DIR" \
+        --kubelet-root-dir "$EDGE_K0S_DATA_DIR/kubelet" \
+        --token-file /etc/k0s/join-token
+    sudo systemctl reset-failed k0sworker 2>/dev/null || true
+    sudo k0s start
+fi
+RETRIES=18
+for i in $(seq 1 $RETRIES); do
+    sudo systemctl is-active k0sworker &>/dev/null && pgrep -f kubelet &>/dev/null && {
+        echo "Worker running (kubelet active)"; break; }
+    [ $i -eq $RETRIES ] && echo "WARNING: kubelet not yet detected — may still be downloading"
+    echo "  Waiting... ($i/$RETRIES)"; sleep 10
+done
+WORKER_SCRIPT
+
+# Verify node joined
+echo "Verifying node joined..."
+RETRIES=18
+for i in $(seq 1 $RETRIES); do
+    NODES=$(KUBECONFIG="$EDGE_KC" kubectl get nodes --no-headers 2>/dev/null | grep -c "Ready" || true)
+    [ "$NODES" -ge 1 ] && { echo "Node joined and Ready!"; break; }
+    [ $i -eq $RETRIES ] && { echo "ERROR: Node not Ready"; exit 1; }
+    echo "  Waiting... ($i/$RETRIES)"
+    sleep 10
+done
+KUBECONFIG="$EDGE_KC" kubectl get nodes -o wide
+
+# (xnat-ingest image is now pulled from ghcr.io by kubelet directly;
+# no ctr-import dance — see config/management.env: XNAT_INGEST_IMAGE.)
+
+# On-prem topology: patch CoreDNS in the child cluster so the
+# konnectivity-agent (and any other in-pod client) can resolve the
+# management TLS hostnames. Without this, konnectivity-agent fails:
+# "lookup konnect.aisedge.local on 10.96.0.10:53: no such host" — because
+# pods use cluster CoreDNS, which doesn't consult the host's /etc/hosts.
+#
+# Cloud topology: skipped — every hostname resolves via real public DNS
+# (CoreDNS's default `forward . /etc/resolv.conf` block handles it through
+# the worker's normal resolver).
+if [ "${INSTALL_TOPOLOGY:-onprem}" = "onprem" ]; then
+    COREDNS_TMP=$(mktemp /tmp/coredns-corefile-XXXXXX)
+    trap "rm -f $COREDNS_TMP" EXIT
+    cat > "$COREDNS_TMP" <<EOF
+.:53 {
+    errors
+    health
+    ready
+    kubernetes cluster.local in-addr.arpa ip6.arpa {
+      pods insecure
+      ttl 30
+      fallthrough in-addr.arpa ip6.arpa
+    }
+    hosts {
+        ${MGMT_NODE_IP} ${SEAWEEDFS_HOSTNAME} ${K0S_API_HOSTNAME} ${KONNECTIVITY_HOSTNAME}
+        fallthrough
+    }
+    prometheus :9153
+    forward . /etc/resolv.conf
+    cache 30
+    loop
+    reload
+    loadbalance
+}
+EOF
+    echo "Patching child cluster CoreDNS Corefile with mgmt-side hostnames..."
+    KUBECONFIG="$EDGE_KC" kubectl create configmap coredns \
+        --from-file=Corefile="$COREDNS_TMP" \
+        --namespace kube-system \
+        --dry-run=client -o yaml \
+        | KUBECONFIG="$EDGE_KC" kubectl apply -f -
+else
+    echo "Cloud topology — leaving child cluster CoreDNS at chart defaults."
+    echo "  In-pod resolution of ${SEAWEEDFS_HOSTNAME} etc. uses the standard"
+    echo "  upstream chain (CoreDNS forward → kubelet's /etc/resolv.conf → public DNS)."
+fi
+
+# Bounce coredns + konnectivity-agent so the new resolution path takes
+# effect immediately (CoreDNS reload plugin should handle it, but
+# restarting is more deterministic for installer logs).
+KUBECONFIG="$EDGE_KC" kubectl rollout restart deployment/coredns -n kube-system 2>/dev/null || true
+KUBECONFIG="$EDGE_KC" kubectl rollout restart daemonset/konnectivity-agent -n kube-system 2>/dev/null || true
 
 echo "=== 06: Complete for ${CLUSTER_NAME} ==="
