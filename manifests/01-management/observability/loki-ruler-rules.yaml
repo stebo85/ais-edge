@@ -1,0 +1,251 @@
+# =============================================================================
+# Loki ruler rules — log-derived alerts.
+# =============================================================================
+# These alerts evaluate LogQL queries on a schedule inside Loki and emit to
+# the kube-prometheus-stack Alertmanager (configured in loki-values.yaml.tpl
+# rulerConfig.alertmanager_url). They cover anything that depends on the
+# pipeline events emitted by the s3-uploader and xnat-ingest-sort pods on
+# every edge child cluster.
+#
+# The mgmt cluster's Prometheus cannot scrape edge pods directly (the
+# konnectivity tunnel is one-way), and pushing Prometheus remote-write back
+# from the edge would require additional ingress + auth surface. Loki
+# already receives every log line from every edge, so running the rules
+# in Loki is the lower-coupling path. Plus the source-of-truth for these
+# alerts is the structured JSON event itself, not a derived metric.
+#
+# Rule file format is identical to Prometheus rule files. Loki's ruler
+# writes firing alerts to Alertmanager v2 with the labels and annotations
+# below, so the existing email/Slack receivers keep working unchanged.
+#
+# Companion: alerts/critical-k8s.yaml + alerts/warning-k8s.yaml + alerts/
+# info-k8s.yaml hold the K8s-metric-based alerts (worker NotReady, pod
+# restarts, certificate expiry) that genuinely live in Prometheus.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-ruler-rules
+  namespace: observability
+data:
+  ais-edge-pipeline.yaml: |
+    groups:
+      # =====================================================================
+      # CRITICAL — page on-call. Pipeline is broken.
+      # =====================================================================
+      - name: ais-edge-pipeline-critical
+        interval: 1m
+        rules:
+          - alert: XNATUploadFailingForAllSessions
+            # Failures appearing while no completed uploads in the same
+            # window — i.e. the pipeline has stopped delivering to S3.
+            expr: |
+              (sum by (cluster) (count_over_time(
+                {namespace="xnat-ingest", component="s3-uploader"}
+                | json | event="upload_failed" [15m])) > 0)
+              and ignoring (cluster)
+              (sum by (cluster) (count_over_time(
+                {namespace="xnat-ingest", component="s3-uploader"}
+                | json | event="upload_completed" [15m])) == 0)
+            for: 15m
+            labels:
+              severity: critical
+              source: loki-ruler
+            annotations:
+              summary: "All upload attempts have failed for 15+ minutes on {{ $labels.cluster }}"
+              description: "No completed uploads while failures keep coming. Likely network / SeaweedFS / credential break. Check `kubectl --kubeconfig kubeconfig-{{ $labels.cluster }} logs -n xnat-ingest -l component=s3-uploader`."
+
+      # =====================================================================
+      # WARNING — notify but don't page.
+      # =====================================================================
+      - name: ais-edge-pipeline-warning
+        interval: 1m
+        rules:
+          - alert: S3UploaderRetryStorm
+            expr: |
+              sum by (cluster) (count_over_time(
+                {namespace="xnat-ingest", component="s3-uploader"}
+                | json | event="upload_failed" [10m])) > 5
+            for: 2m
+            labels:
+              severity: warning
+              source: loki-ruler
+            annotations:
+              summary: ">5 upload failures in 10 minutes on {{ $labels.cluster }}"
+              description: "Edge s3-uploader is retrying. Likely transient network or credentials. Inspect pod logs for the actual error."
+
+          - alert: SessionUploadStalled
+            # An upload_started for a session without a corresponding
+            # upload_completed in the same 15-min window.
+            expr: |
+              (sum by (cluster, session) (count_over_time(
+                {namespace="xnat-ingest", component="s3-uploader"}
+                | json | event="upload_started" [15m])) > 0)
+              unless on (cluster, session)
+              (sum by (cluster, session) (count_over_time(
+                {namespace="xnat-ingest", component="s3-uploader"}
+                | json | event="upload_completed" [15m])) > 0)
+            for: 5m
+            labels:
+              severity: warning
+              source: loki-ruler
+            annotations:
+              summary: "Session {{ $labels.session }} on {{ $labels.cluster }} has been uploading for 15+ minutes"
+              description: "mc mirror started but did not complete within the expected window. Could be a slow network, large session, or stuck retry."
+
+          - alert: XNATBacklogGrowing
+            # Sessions arriving in S3 faster than they're consumed by
+            # the mgmt-side xnat-ingest-upload pod (event=xnat_upload_completed).
+            expr: |
+              (sum(count_over_time(
+                {namespace="xnat-ingest", component="s3-uploader"}
+                | json | event="upload_completed" [30m]))
+               -
+               sum(count_over_time(
+                {namespace="xnat-upload"}
+                | json | event="xnat_upload_completed" [30m]))
+              ) > 3
+            for: 30m
+            labels:
+              severity: warning
+              source: loki-ruler
+            annotations:
+              summary: "XNAT upload backlog is growing"
+              description: "Sessions are landing in SeaweedFS faster than they're being pushed to XNAT. xnat-ingest-upload may be slow or partially failing — check `kubectl logs -n xnat-upload -l app=xnat-ingest-upload`."
+
+          - alert: DICOMValidationFailureSpike
+            expr: |
+              sum by (cluster) (count_over_time(
+                {namespace="xnat-ingest", component="sort"}
+                |~ "(?i)invalid|validation.*fail" [1h])) > 10
+            for: 5m
+            labels:
+              severity: warning
+              source: loki-ruler
+            annotations:
+              summary: ">10 invalid DICOM sessions on {{ $labels.cluster }} in last hour"
+              description: "Sessions are landing in __invalid__/. Likely a scanner exporting DICOMs without AccessionNumber — check scanner config."
+
+      # =====================================================================
+      # INFO — observability + audit. Fires on every successful upload to XNAT
+      # so operators / auditors can confirm the pipeline reached its terminal
+      # step. Routed to email-primary via Alertmanager (see
+      # alertmanager-config.yaml.tpl — route override on alertname).
+      # =====================================================================
+      - name: ais-edge-pipeline-info
+        interval: 30s
+        rules:
+          - alert: XNATUploadSuccess
+            # Fires the moment xnat-ingest-upload logs "Successfully uploaded
+            # all files in '<session>'". The same log line is emitted twice
+            # per session (once after resource upload, once after metadata
+            # extraction). Alertmanager's group_by + group_interval coalesces
+            # those into a single notification per session.
+            #
+            # rate(...) converts the boolean match into events-per-second;
+            # > 0 means at least one match in the past 30s. for: 0s fires
+            # immediately on first match.
+            expr: |
+              sum by (cluster) (
+                rate({namespace="xnat-upload"}
+                     |~ "Successfully uploaded all files in" [30s])
+              ) > 0
+            for: 0s
+            labels:
+              severity: info
+              source: loki-ruler
+              category: pipeline-success
+            annotations:
+              summary: "XNAT upload completed"
+              description: |
+                xnat-ingest-upload successfully pushed at least one session
+                to XNAT in the last 30 seconds. Check the pod logs for the
+                exact session ID:
+                  kubectl -n xnat-upload logs deploy/xnat-ingest-upload --tail=30
+
+          - alert: XNATAuthFailure
+            # 401 / 403 from XNAT API. Surfaces credential rot, account
+            # lockout, or XNAT-side proxy misconfig (e.g. the https→http
+            # downgrade we caught earlier). Warning rather than critical
+            # because retries may still succeed within the loop window.
+            expr: |
+              sum by (cluster) (count_over_time(
+                {namespace="xnat-upload"}
+                |~ "(?i)\\b(401|403|unauthorized|forbidden)\\b" [5m])) > 0
+            for: 1m
+            labels:
+              severity: warning
+              source: loki-ruler
+              category: xnat-auth
+            annotations:
+              summary: "XNAT rejected authenticated calls from xnat-ingest-upload"
+              description: |
+                The xnat-ingest-upload pod hit a 401/403 from XNAT in the
+                last 5 minutes. Check XNAT_URL/USER/PASS in the
+                xnat-credentials Secret and that the XNAT admin account
+                isn't locked.
+
+          - alert: OrthancLuaHookError
+            # The Orthanc Lua hook logs tracebacks if the label callback
+            # fails. Lua errors can block the study from being labelled
+            # ready, which silently stalls the pipeline.
+            expr: |
+              sum by (cluster) (count_over_time(
+                {namespace="xnat-ingest", app="orthanc"}
+                |~ "(?i)lua.*error|traceback|stack\\s+traceback" [10m])) > 0
+            for: 1m
+            labels:
+              severity: warning
+              source: loki-ruler
+              category: orthanc
+            annotations:
+              summary: "Orthanc Lua hook errored on {{ $labels.cluster }}"
+              description: |
+                The deidentify-and-forward.lua hook produced a Lua error in
+                the last 10 minutes. Inspect the Orthanc pod logs.
+
+          - alert: S3UploaderRestartedRecently
+            # The s3-uploader exits non-zero (and crashloops) when its mc
+            # alias setup fails — the fix we committed today. A restart
+            # within 5m means SeaweedFS was unreachable at pod start, or
+            # the edge-writer S3 key is wrong. Often transient at install
+            # time; a sustained spike means a real config drift.
+            expr: |
+              sum by (cluster) (count_over_time(
+                {namespace="xnat-ingest", component="s3-uploader"}
+                |~ "(?i)refusing to start upload loop|alias_failed" [5m])) > 0
+            for: 2m
+            labels:
+              severity: warning
+              source: loki-ruler
+              category: s3-auth
+            annotations:
+              summary: "s3-uploader on {{ $labels.cluster }} could not establish its S3 alias"
+              description: |
+                The s3-uploader pre-flight probe (mc alias + bucket round-
+                trip) failed in the last 5 minutes. Check the SeaweedFS
+                Ingress is reachable, the edge-writer key matches the IAM
+                JSON in scripts/03, and the ca-bundle Secret contains the
+                ais-edge-ca cert.
+
+          - alert: OrthancStorageGrowing
+            # Orthanc accepts C-STOREs into local storage before sort
+            # pulls them out. If staging fills up faster than sort drains
+            # it, the edge will OOM. >1k stored instances accumulated over
+            # the last hour is a useful early-warning threshold; tune per
+            # site volume.
+            expr: |
+              sum by (cluster) (count_over_time(
+                {namespace="xnat-ingest", app="orthanc"}
+                |~ "(?i)new stored instance" [1h])) > 1000
+            for: 5m
+            labels:
+              severity: warning
+              source: loki-ruler
+              category: orthanc-backlog
+            annotations:
+              summary: "Orthanc received >1k instances on {{ $labels.cluster }} in the last hour"
+              description: |
+                Either a real ingest spike (legitimate, may need to scale
+                edge storage) or sort isn't draining Orthanc. Check the
+                sort pod's REST-pull loop and Orthanc's storage PVC size.

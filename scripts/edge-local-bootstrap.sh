@@ -88,9 +88,8 @@ case "${EDGE_ORTHANC_MODE}" in
         fi
         ;;
     managed)
-        ${SUDO} mkdir -p "${EDGE_DATA_HOST_PATH}/orthanc-storage" /data/facility-backup
+        ${SUDO} mkdir -p "${EDGE_DATA_HOST_PATH}/orthanc-storage"
         ${SUDO} chmod 777 "${EDGE_DATA_HOST_PATH}/orthanc-storage"
-        ${SUDO} chmod 750 /data/facility-backup
         ;;
     *)
         echo "ERROR: unknown EDGE_ORTHANC_MODE='${EDGE_ORTHANC_MODE}'" >&2
