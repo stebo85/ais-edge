@@ -7,6 +7,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/00-common.sh"
 
 echo "=== 02: Installing cert-manager + k0smotron ==="
 
+# The upstream "stable" install manifest currently serves v1beta1 CRDs but
+# may point at a newer controller image that watches v1beta2. Pin the
+# controller image to the repo-tested release unless explicitly overridden.
+K0SMOTRON_IMAGE="${K0SMOTRON_IMAGE:-quay.io/k0sproject/k0smotron:v1.10.4}"
+
 # Helper: wait until at least one pod matching a label exists in a namespace,
 # then wait until they are all Ready. The "wait for at least one pod first"
 # step avoids the classic race where `kubectl apply` returns before the
@@ -69,6 +74,15 @@ else
     echo "k0smotron: already installed"
     wait_pods_ready k0smotron
 fi
+
+CURRENT_IMAGE=$(kubectl -n k0smotron get deploy/k0smotron-controller-manager \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}' 2>/dev/null || true)
+if [ "${CURRENT_IMAGE}" != "${K0SMOTRON_IMAGE}" ]; then
+    echo "Pinning k0smotron controller image: ${K0SMOTRON_IMAGE}"
+    kubectl -n k0smotron set image deploy/k0smotron-controller-manager \
+        manager="${K0SMOTRON_IMAGE}"
+fi
+kubectl -n k0smotron rollout status deploy/k0smotron-controller-manager --timeout=180s
 
 echo "=== 02: Complete ==="
 kubectl get crds | grep k0smotron | head -3
