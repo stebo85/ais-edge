@@ -59,6 +59,7 @@ HAPROXY_KEY="${TMP_DIR}/haproxy-server.key"
 HAPROXY_CSR="${TMP_DIR}/haproxy-server.csr"
 HAPROXY_CRT="${TMP_DIR}/haproxy-server.crt"
 HAPROXY_CONF="${TMP_DIR}/haproxy-server.cnf"
+HAPROXY_SERIAL="${TMP_DIR}/ca.srl"
 
 kubectl get secret -n "${CLUSTER_NAME}" "${CLUSTER_NAME}-ca" \
     -o jsonpath='{.data.tls\.crt}' | base64 -d > "${HAPROXY_CA}"
@@ -91,7 +92,7 @@ openssl genrsa -out "${HAPROXY_KEY}" 2048 2>/dev/null
 openssl req -new -key "${HAPROXY_KEY}" -subj "/CN=k0smotron-haproxy" \
     -out "${HAPROXY_CSR}" -config "${HAPROXY_CONF}" 2>/dev/null
 openssl x509 -req -in "${HAPROXY_CSR}" -CA "${HAPROXY_CA}" -CAkey "${HAPROXY_CAKEY}" \
-    -CAcreateserial -out "${HAPROXY_CRT}" -days 3650 \
+    -CAserial "${HAPROXY_SERIAL}" -CAcreateserial -out "${HAPROXY_CRT}" -days 3650 \
     -extensions v3_req -extfile "${HAPROXY_CONF}" 2>/dev/null
 cat "${HAPROXY_CRT}" "${HAPROXY_KEY}" > "${OUT_DIR}/haproxy/server.pem"
 chmod 0644 "${OUT_DIR}/haproxy/ca.crt"
