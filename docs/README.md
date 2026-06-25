@@ -16,7 +16,7 @@ Operations → Risks → Replacements / Future).
 ### Data plane
 
 - [`orthanc.md`](components/orthanc.md) — DICOM SCP at the edge; runs
-  the deid Lua hook before xnat-ingest sees the data
+  the Lua label hook before xnat-ingest sees the data
 - [`seaweedfs.md`](components/seaweedfs.md) — S3-compatible storage for
   staged DICOM files
 - [`mc.md`](components/mc.md) — MinIO client; the S3 uploader on each edge

@@ -185,11 +185,10 @@ data:
                 xnat-credentials Secret and that the XNAT admin account
                 isn't locked.
 
-          - alert: OrthancDeidLuaError
-            # The Orthanc Lua deid hook logs Lua tracebacks when it can't
-            # apply a Replace/Keep rule (often a malformed
-            # deidentification-profile.json). Lua errors block the study
-            # from being labelled ready, which silently stalls the pipeline.
+          - alert: OrthancLuaHookError
+            # The Orthanc Lua hook logs tracebacks if the label callback
+            # fails. Lua errors can block the study from being labelled
+            # ready, which silently stalls the pipeline.
             expr: |
               sum by (cluster) (count_over_time(
                 {namespace="xnat-ingest", app="orthanc"}
@@ -198,13 +197,12 @@ data:
             labels:
               severity: warning
               source: loki-ruler
-              category: deid
+              category: orthanc
             annotations:
-              summary: "Orthanc deid Lua hook errored on {{ $labels.cluster }}"
+              summary: "Orthanc Lua hook errored on {{ $labels.cluster }}"
               description: |
                 The deidentify-and-forward.lua hook produced a Lua error in
-                the last 10 minutes. Inspect the Orthanc pod logs and check
-                the deidentification-profile.json for syntax issues.
+                the last 10 minutes. Inspect the Orthanc pod logs.
 
           - alert: S3UploaderRestartedRecently
             # The s3-uploader exits non-zero (and crashloops) when its mc
@@ -231,7 +229,7 @@ data:
                 ais-edge-ca cert.
 
           - alert: OrthancStorageGrowing
-            # Orthanc accepts C-STOREs into local storage before deid + sort
+            # Orthanc accepts C-STOREs into local storage before sort
             # pulls them out. If staging fills up faster than sort drains
             # it, the edge will OOM. >1k stored instances accumulated over
             # the last hour is a useful early-warning threshold; tune per

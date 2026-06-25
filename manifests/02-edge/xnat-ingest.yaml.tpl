@@ -30,7 +30,7 @@ stringData:
 #
 # Label contract with Orthanc:
 #   --orthanc-label xnat-ingest-ready   only consider instances with this label
-#                                   (added by the Lua deid hook on success)
+#                                   (added by the Orthanc Lua label hook)
 #   --orthanc-skip-label xnat-ingest-skip   skip instances already staged
 #                                   (sort adds this label after hardlink)
 apiVersion: apps/v1

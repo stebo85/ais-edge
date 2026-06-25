@@ -34,8 +34,8 @@ for arg in "$@"; do
 done
 [ -t 0 ] || INTERACTIVE=false
 
-# Forwarded to child scripts (e.g. 07c's deid-policy review prompt). When
-# install.sh is non-interactive, child scripts should auto-confirm too.
+# Forwarded to child scripts. When install.sh is non-interactive, child
+# scripts should auto-confirm too.
 if ! $INTERACTIVE; then export AIS_AUTO_CONFIRM="yes"; fi
 
 confirm() {
@@ -56,13 +56,9 @@ REQUIRED_VARS=(
     INTERNAL_DOMAIN SEAWEEDFS_HOSTNAME K0S_API_HOSTNAME
     KONNECTIVITY_HOSTNAME INGRESS_PORT
 )
-if [ "${EDGE_ORTHANC_MODE:-managed}" != "external" ]; then
-    REQUIRED_VARS+=(AIS_DEID_HMAC_SALT)
-fi
 for var in "${REQUIRED_VARS[@]}"; do
     if [ -z "${!var:-}" ]; then
         echo "ERROR: ${var} is not set in config/management.env"
-        [ "$var" = "AIS_DEID_HMAC_SALT" ] && echo "       Generate one with: openssl rand -hex 32"
         exit 1
     fi
 done
@@ -187,25 +183,14 @@ if [ "${INSTALL_TOPOLOGY:-onprem}" = "cloud" ]; then
 fi
 
 if [ "${EDGE_ORTHANC_MODE:-managed}" != "external" ]; then
-    # Orthanc per-site config is edited by hand. Fail fast here rather than
-    # 10 minutes into mgmt setup at step 07c.
-    if [ ! -f "${SCRIPT_DIR}/config/orthanc/routing.json" ]; then
-        echo "ERROR: config/orthanc/routing.json not found"
-        echo "       Copy from the template and fill in AETMap:"
-        echo "         cp config/orthanc/routing.json.template config/orthanc/routing.json"
-        echo "         vim config/orthanc/routing.json"
-        exit 1
-    fi
-    # Deidentification profile must be filled in. Ships as a .template; the
-    # Site admin copies it from the template and customises to the site's deid policy.
-    if [ ! -f "${SCRIPT_DIR}/config/orthanc/deidentification-profile.json" ]; then
-        echo "ERROR: config/orthanc/deidentification-profile.json not found"
-        echo "       Copy the template and customise to your site's deid policy:"
-        echo "         cp config/orthanc/deidentification-profile.json.template \\"
-        echo "            config/orthanc/deidentification-profile.json"
-        echo "         vim config/orthanc/deidentification-profile.json"
-        exit 1
-    fi
+    # Managed Orthanc ships with static config and a label-only Lua hook.
+    # Fail fast here rather than 10 minutes into mgmt setup at step 07c.
+    for f in config/orthanc/orthanc.json config/orthanc/deidentify-and-forward.lua; do
+        if [ ! -f "${SCRIPT_DIR}/${f}" ]; then
+            echo "ERROR: ${f} not found"
+            exit 1
+        fi
+    done
 else
     echo "EDGE_ORTHANC_MODE=external — skipping repo-managed Orthanc config validation."
 fi
@@ -256,7 +241,7 @@ echo "     07b. Deploy Vector log shipper (skipped if observability disabled)"
 if [ "${EDGE_ORTHANC_MODE:-managed}" = "external" ]; then
     echo "     07c. Skip Orthanc deploy (EDGE_ORTHANC_MODE=external)"
 else
-    echo "     07c. Deploy Orthanc DICOM receiver + deid hook"
+    echo "     07c. Deploy Orthanc DICOM receiver + label hook"
 fi
 echo ""
 echo "============================================"
@@ -383,7 +368,7 @@ for entry in "${EDGE_NODES[@]}"; do
     [[ $REPLY =~ ^[Ss]$ ]] || bash "${SCRIPT_DIR}/scripts/07b-deploy-edge-observability.sh" "$entry"
 
     echo ""
-    echo "--- Step 07c: Deploy Orthanc DICOM receiver + deid hook on ${name} ---"
+    echo "--- Step 07c: Deploy Orthanc DICOM receiver + label hook on ${name} ---"
     confirm "Run step 07c for ${name}? (y/s to skip) "
     [[ $REPLY =~ ^[Ss]$ ]] || bash "${SCRIPT_DIR}/scripts/07c-deploy-edge-orthanc.sh" "$entry"
 done

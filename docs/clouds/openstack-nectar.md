@@ -135,7 +135,7 @@ amphora-build timeout fires.
 | 06  | Per edge: install k0s worker, join through the LB | Cloud mode skips the `/etc/hosts` + CoreDNS-patch the onprem path does |
 | 07  | Per edge: xnat-ingest sort + s3-uploader pods | `hostAliases:` block stripped in cloud mode |
 | 07b | Per edge: Vector log shipper | Push endpoint is the public Loki hostname |
-| 07c | Per edge: Orthanc + deidentification Lua hook | Same |
+| 07c | Per edge: Orthanc + label Lua hook | Same |
 
 ## Verification checklist
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Step 07c: Deploy Orthanc DICOM receiver + deid hook on the edge cluster.
+# Step 07c: Deploy Orthanc DICOM receiver + label hook on the edge cluster.
 #           Runs alongside xnat-ingest sort (deployed in step 07).
 #           Usage: ./07c-deploy-edge-orthanc.sh <edge-entry>
 # =============================================================================
@@ -30,59 +30,21 @@ for f in orthanc.json deidentify-and-forward.lua; do
     fi
 done
 
-# routing.json is site-edited — must be copied from the template
-# and filled in with the AETMap entries for this site's modalities.
-if [ ! -f "${ORTHANC_CFG_DIR}/routing.json" ]; then
-    echo "ERROR: ${ORTHANC_CFG_DIR}/routing.json not found"
-    echo "       Copy from the template and edit the AETMap:"
-    echo "         cp ${ORTHANC_CFG_DIR}/routing.json.template ${ORTHANC_CFG_DIR}/routing.json"
-    echo "         vim ${ORTHANC_CFG_DIR}/routing.json"
-    exit 1
-fi
-
-if [ -z "${AIS_DEID_HMAC_SALT:-}" ]; then
-    echo "ERROR: AIS_DEID_HMAC_SALT not set in config/management.env"
-    echo "       Generate one with: openssl rand -hex 32"
-    exit 1
-fi
-
 ORTHANC_IMAGE="${ORTHANC_IMAGE:-jodogne/orthanc-plugins:1.12.6}"
 
 echo "=== 07c: Deploying Orthanc on ${CLUSTER_NAME} ==="
 echo "Image:  ${ORTHANC_IMAGE}"
 
-# --- Site-admin confirmation: deid policy review ---
-# Deid is a regulatory + ethical surface. Don't deploy without an explicit
-# acknowledgement that the site admin has read what's being applied. Show the
-# routing table and the list of profiles, then prompt.
-echo
-echo "=== Deidentification policy that will be deployed ==="
-echo
-echo "--- routing.json (AET -> profile + project) ---"
-sed -n '/"AETMap"/,/^  }/p' "${ORTHANC_CFG_DIR}/routing.json" | head -30
-echo
-echo "--- deidentification profile to be installed ---"
-echo "  ${ORTHANC_CFG_DIR}/deidentification-profile.json"
-echo
-# Honour the -y / --yes flag the parent install.sh forwards via env if set.
-# Otherwise prompt interactively. Skip if stdin isn't a TTY (CI runs).
-if [ "${AIS_AUTO_CONFIRM:-}" != "yes" ] && [ -t 0 ]; then
-    read -p "Have you reviewed the AETMap + profiles above? [y/N] " -r REPLY
-    [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted at deid-policy review."; exit 1; }
-fi
-
 # --- Host-side directories on the edge ---
 if [ "${AIS_EDGE_NO_SSH:-}" = "1" ] || [ "${EDGE_JOIN_MODE:-ssh}" = "manual" ]; then
     echo "Skipping SSH directory setup for ${CLUSTER_NAME}; expecting local bootstrap already prepared:"
     echo "  /data/xnat-ingest/orthanc-storage"
-    echo "  /data/facility-backup"
 else
     ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "
-        sudo mkdir -p /data/xnat-ingest/orthanc-storage /data/facility-backup
+        sudo mkdir -p /data/xnat-ingest/orthanc-storage
         sudo chmod 777 /data/xnat-ingest/orthanc-storage
-        sudo chmod 750 /data/facility-backup
     "
-    echo "Edge directories ready: /data/xnat-ingest/orthanc-storage, /data/facility-backup"
+    echo "Edge directories ready: /data/xnat-ingest/orthanc-storage"
 fi
 
 # --- Namespace (idempotent if 07 already ran) ---
@@ -97,43 +59,18 @@ KUBECONFIG="$EDGE_KC" kubectl create configmap orthanc-config \
     --dry-run=client -o yaml \
     | KUBECONFIG="$EDGE_KC" kubectl apply -f -
 
-# orthanc-scripts: lua hooks (deid + forward + study label)
+# orthanc-scripts: lua hook that labels stable studies for ingest
 KUBECONFIG="$EDGE_KC" kubectl create configmap orthanc-scripts \
     --namespace xnat-ingest \
     --from-file="${ORTHANC_CFG_DIR}/deidentify-and-forward.lua" \
     --dry-run=client -o yaml \
     | KUBECONFIG="$EDGE_KC" kubectl apply -f -
 
-# orthanc-routing: per-site AET -> project mapping
-KUBECONFIG="$EDGE_KC" kubectl create configmap orthanc-routing \
-    --namespace xnat-ingest \
-    --from-file=routing.json="${ORTHANC_CFG_DIR}/routing.json" \
-    --dry-run=client -o yaml \
-    | KUBECONFIG="$EDGE_KC" kubectl apply -f -
-
-# orthanc-deidentification-profile: the single deidentification-profile.json
-# file (site-edited, copied from .template). Loaded directly
-# by the Lua hook for every accepted study.
-if [ ! -f "${ORTHANC_CFG_DIR}/deidentification-profile.json" ]; then
-    echo "ERROR: ${ORTHANC_CFG_DIR}/deidentification-profile.json not found"
-    echo "       Copy the template and customise to your site's deid policy:"
-    echo "         cp ${ORTHANC_CFG_DIR}/deidentification-profile.json.template \\"
-    echo "            ${ORTHANC_CFG_DIR}/deidentification-profile.json"
-    echo "         vim ${ORTHANC_CFG_DIR}/deidentification-profile.json"
-    exit 1
-fi
-KUBECONFIG="$EDGE_KC" kubectl create configmap orthanc-deidentification-profile \
-    --namespace xnat-ingest \
-    --from-file=deidentification-profile.json="${ORTHANC_CFG_DIR}/deidentification-profile.json" \
-    --dry-run=client -o yaml \
-    | KUBECONFIG="$EDGE_KC" kubectl apply -f -
-
-echo "ConfigMaps applied: orthanc-config, orthanc-scripts, orthanc-routing, orthanc-deidentification-profile"
+echo "ConfigMaps applied: orthanc-config, orthanc-scripts"
 
 # --- Secret + Deployment + Service ---
 render "${REPO_DIR}/manifests/02-edge/orthanc.yaml.tpl" \
     ORTHANC_IMAGE "$ORTHANC_IMAGE" \
-    AIS_DEID_HMAC_SALT "$AIS_DEID_HMAC_SALT" \
     | KUBECONFIG="$EDGE_KC" kubectl apply -f -
 
 echo "Waiting for Orthanc pod..."
