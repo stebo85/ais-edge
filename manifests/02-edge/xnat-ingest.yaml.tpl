@@ -17,10 +17,16 @@ stringData:
   access-key: "{{S3_EDGE_ACCESS_KEY}}"
   secret-key: "{{S3_EDGE_SECRET_KEY}}"
 ---
-# Sort pod: REST-pulls deid'd instances from Orthanc, hardlinks the DICOM
-# files from Orthanc's storage tree (/data/orthanc-storage) into staging
-# (/data/staging/PROJECT.SUBJECT.VISIT/). Hardlink requires same filesystem,
-# which is why the Orthanc pod and this pod share the same /data hostPath.
+# Sort pod: REST-pulls instances from Orthanc, hardlinks the DICOM files
+# from Orthanc's storage tree into staging. By default Orthanc is the
+# repo-managed Service in this namespace, but deployments with an existing
+# facility Orthanc can point ORTHANC_URL at that API and bind-mount the
+# existing Orthanc storage into the DATA_HOST_PATH tree before bootstrap.
+#
+# Hardlink requires same filesystem, which is why the default managed
+# Orthanc pod and this pod share the same /data hostPath. For an existing
+# Orthanc, bind-mount or otherwise expose its storage under the same
+# hostPath used for staging to avoid EXDEV hardlink failures.
 #
 # Label contract with Orthanc:
 #   --orthanc-label xnat-ingest-ready   only consider instances with this label
@@ -70,13 +76,10 @@ spec:
           args:
             - "/data/staging"
             - "--orthanc-url"
-            - "http://orthanc.xnat-ingest.svc.cluster.local:8042"
+            - "{{ORTHANC_URL}}"
             - "--orthanc-storage-dir"
-            - "/data/orthanc-storage"
-            - "--orthanc-label"
-            - "xnat-ingest-ready"
-            - "--orthanc-skip-label"
-            - "xnat-ingest-skip"
+            - "{{ORTHANC_STORAGE_DIR}}"
+{{ORTHANC_LABEL_ARGS}}
             - "--project-id"
             - "{{PROJECT_ID}}"
             - "--loop"
@@ -92,7 +95,7 @@ spec:
       volumes:
         - name: data
           hostPath:
-            path: /data/xnat-ingest
+            path: {{EDGE_DATA_HOST_PATH}}
             type: DirectoryOrCreate
 ---
 # S3 uploader: watches /data/staging for completed sessions, mirrors them
@@ -307,7 +310,7 @@ spec:
       volumes:
         - name: data
           hostPath:
-            path: /data/xnat-ingest
+            path: {{EDGE_DATA_HOST_PATH}}
             type: DirectoryOrCreate
         - name: ca-bundle
           secret:

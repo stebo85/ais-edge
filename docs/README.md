@@ -64,6 +64,9 @@ Operations → Risks → Replacements / Future).
   `INSTALL_TOPOLOGY=cloud` deployment shape for managed Kubernetes
   (EKS / GKE / AKS / Magnum / Nectar). Cloud LB + real DNS, the dev
   test on nip.io, and the dev-to-prod swap procedure.
+- [`rsl60-existing-orthanc-deployment.md`](rsl60-existing-orthanc-deployment.md)
+  — XNAT-host deployment with `rsl60` as a manual-join facility worker
+  and Orthanc already running on `rsl60`.
 - [`clouds/`](clouds/README.md) — **per-cloud install guides**:
   [openstack-nectar.md](clouds/openstack-nectar.md) (E2E tested),
   [aws.md](clouds/aws.md), [gcp.md](clouds/gcp.md),

@@ -15,11 +15,42 @@ parse_edge_entry "$1"
 
 echo "=== 07: Deploying xnat-ingest on ${CLUSTER_NAME} ==="
 
-# Sort's hardlink target. Other edge data dirs (orthanc-storage,
-# facility-backup) are created by 07c-deploy-edge-orthanc.sh.
-ssh ${SSH_KEY_OPT} "${EDGE_SSH}" \
-    "sudo mkdir -p /data/xnat-ingest/staging && sudo chmod 777 /data/xnat-ingest/staging"
-echo "Data directories ready on ${NODE_IP}"
+EDGE_DATA_HOST_PATH="${EDGE_DATA_HOST_PATH:-/data/xnat-ingest}"
+ORTHANC_URL="${EDGE_ORTHANC_URL:-http://orthanc.xnat-ingest.svc.cluster.local:8042}"
+ORTHANC_STORAGE_DIR="${EDGE_ORTHANC_STORAGE_DIR:-/data/orthanc-storage}"
+ORTHANC_LABEL="${EDGE_ORTHANC_LABEL:-xnat-ingest-ready}"
+ORTHANC_SKIP_LABEL="${EDGE_ORTHANC_SKIP_LABEL:-xnat-ingest-skip}"
+
+if [[ "${PROJECT_ID}" == *REPLACE_WITH* ]] || [[ "${ORTHANC_URL}" == *REPLACE_WITH* ]]; then
+    echo "ERROR: edge config still contains placeholder values." >&2
+    echo "  PROJECT_ID=${PROJECT_ID}" >&2
+    echo "  EDGE_ORTHANC_URL=${ORTHANC_URL}" >&2
+    echo "Edit config/edge-nodes.env before deploying xnat-ingest." >&2
+    exit 1
+fi
+
+ORTHANC_LABEL_ARGS=""
+if [ -n "${ORTHANC_LABEL}" ]; then
+    ORTHANC_LABEL_ARGS=$(printf '            - "--orthanc-label"\n            - "%s"' "${ORTHANC_LABEL}")
+fi
+if [ -n "${ORTHANC_SKIP_LABEL}" ]; then
+    if [ -n "${ORTHANC_LABEL_ARGS}" ]; then
+        ORTHANC_LABEL_ARGS="${ORTHANC_LABEL_ARGS}"$'\n'
+    fi
+    ORTHANC_LABEL_ARGS="${ORTHANC_LABEL_ARGS}$(printf '            - "--orthanc-skip-label"\n            - "%s"' "${ORTHANC_SKIP_LABEL}")"
+fi
+
+# Sort's hardlink target. Other edge data dirs are created by 07c for
+# repo-managed Orthanc, or by scripts/edge-local-bootstrap.sh for manual
+# / unreachable-edge installs.
+if [ "${AIS_EDGE_NO_SSH:-}" = "1" ] || [ "${EDGE_JOIN_MODE:-ssh}" = "manual" ]; then
+    echo "Skipping SSH directory setup for ${CLUSTER_NAME}; expecting local bootstrap already prepared:"
+    echo "  ${EDGE_DATA_HOST_PATH}/staging"
+else
+    ssh ${SSH_KEY_OPT} "${EDGE_SSH}" \
+        "sudo mkdir -p '${EDGE_DATA_HOST_PATH}/staging' && sudo chmod 777 '${EDGE_DATA_HOST_PATH}/staging'"
+    echo "Data directories ready on ${NODE_IP}"
+fi
 
 # Phase 2: ensure namespace exists and push the CA bundle as a Secret. The
 # s3-uploader pod mounts this so mc can verify the seaweedfs-tls server cert
@@ -49,6 +80,10 @@ render_with_topology "${REPO_DIR}/manifests/02-edge/xnat-ingest.yaml.tpl" \
     PROJECT_ID "$PROJECT_ID" \
     INGEST_LOOP_SECONDS "$INGEST_LOOP_SECONDS" \
     INGEST_WAIT_PERIOD "$INGEST_WAIT_PERIOD" \
+    EDGE_DATA_HOST_PATH "$EDGE_DATA_HOST_PATH" \
+    ORTHANC_URL "$ORTHANC_URL" \
+    ORTHANC_STORAGE_DIR "$ORTHANC_STORAGE_DIR" \
+    ORTHANC_LABEL_ARGS "$ORTHANC_LABEL_ARGS" \
     S3_BUCKET "$S3_BUCKET" \
     MGMT_NODE_IP "${MGMT_NODE_IP:-}" \
     SEAWEEDFS_HOSTNAME "$SEAWEEDFS_HOSTNAME" \
@@ -66,8 +101,10 @@ KUBECONFIG="$EDGE_KC" kubectl get pods -n xnat-ingest -o wide
 
 # Verify the TLS path from the edge VM. Phase 2 has no HTTP fallback —
 # only :443 is exposed. Expect HTTP 403 (S3 unauthenticated GET on /).
-echo "Verifying TLS path from edge VM..."
-if [ -f "${REPO_DIR}/ais-edge-ca.crt" ]; then
+if [ "${AIS_EDGE_NO_SSH:-}" = "1" ] || [ "${EDGE_JOIN_MODE:-ssh}" = "manual" ]; then
+    echo "Skipping edge-host TLS smoke test for ${CLUSTER_NAME}; SSH is disabled for this edge."
+elif [ -f "${REPO_DIR}/ais-edge-ca.crt" ]; then
+    echo "Verifying TLS path from edge VM..."
     scp -q ${SSH_KEY_OPT} "${REPO_DIR}/ais-edge-ca.crt" "${EDGE_SSH}:/tmp/ais-edge-ca.crt"
     TLS_HTTP=$(ssh ${SSH_KEY_OPT} "${EDGE_SSH}" \
         "curl -s -o /dev/null -w '%{http_code}' --cacert /tmp/ais-edge-ca.crt https://${SEAWEEDFS_HOSTNAME}/" \
@@ -77,5 +114,9 @@ if [ -f "${REPO_DIR}/ais-edge-ca.crt" ]; then
 fi
 
 echo "=== 07: Complete for ${CLUSTER_NAME} ==="
-echo "Sort is in REST-pull mode against Orthanc."
-echo "Push test DICOMs via C-STORE to AET=AISEDGE ${NODE_IP}:4242 (see step 07c output)."
+echo "Sort is in REST-pull mode against Orthanc: ${ORTHANC_URL}"
+if [ "${EDGE_ORTHANC_MODE:-managed}" = "external" ]; then
+    echo "Existing Orthanc mode: confirm rsl60's Orthanc is receiving DICOMs and exposes the storage mounted at ${ORTHANC_STORAGE_DIR} in the sort pod."
+else
+    echo "Push test DICOMs via C-STORE to AET=AISEDGE ${NODE_IP}:4242 (see step 07c output)."
+fi

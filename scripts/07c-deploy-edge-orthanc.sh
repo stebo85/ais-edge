@@ -13,6 +13,13 @@ if [ $# -lt 1 ]; then
 fi
 parse_edge_entry "$1"
 
+if [ "${EDGE_ORTHANC_MODE:-managed}" = "external" ] || [ "${AIS_SKIP_ORTHANC_DEPLOY:-}" = "1" ]; then
+    echo "=== 07c: Orthanc deploy — SKIPPED for ${CLUSTER_NAME} ==="
+    echo "EDGE_ORTHANC_MODE=external means an existing Orthanc is expected at:"
+    echo "  ${EDGE_ORTHANC_URL:-<set EDGE_ORTHANC_URL in config/edge-nodes.env>}"
+    exit 0
+fi
+
 ORTHANC_CFG_DIR="${REPO_DIR}/config/orthanc"
 
 # --- Validate required inputs ---
@@ -65,12 +72,18 @@ if [ "${AIS_AUTO_CONFIRM:-}" != "yes" ] && [ -t 0 ]; then
 fi
 
 # --- Host-side directories on the edge ---
-ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "
-    sudo mkdir -p /data/xnat-ingest/orthanc-storage /data/facility-backup
-    sudo chmod 777 /data/xnat-ingest/orthanc-storage
-    sudo chmod 750 /data/facility-backup
-"
-echo "Edge directories ready: /data/xnat-ingest/orthanc-storage, /data/facility-backup"
+if [ "${AIS_EDGE_NO_SSH:-}" = "1" ] || [ "${EDGE_JOIN_MODE:-ssh}" = "manual" ]; then
+    echo "Skipping SSH directory setup for ${CLUSTER_NAME}; expecting local bootstrap already prepared:"
+    echo "  /data/xnat-ingest/orthanc-storage"
+    echo "  /data/facility-backup"
+else
+    ssh ${SSH_KEY_OPT} "${EDGE_SSH}" "
+        sudo mkdir -p /data/xnat-ingest/orthanc-storage /data/facility-backup
+        sudo chmod 777 /data/xnat-ingest/orthanc-storage
+        sudo chmod 750 /data/facility-backup
+    "
+    echo "Edge directories ready: /data/xnat-ingest/orthanc-storage, /data/facility-backup"
+fi
 
 # --- Namespace (idempotent if 07 already ran) ---
 KUBECONFIG="$EDGE_KC" kubectl create namespace xnat-ingest --dry-run=client -o yaml \

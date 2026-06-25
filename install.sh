@@ -50,10 +50,16 @@ confirm() {
 }
 
 # --- Validate required config ---
-for var in MGMT_NODE_IP XNAT_URL XNAT_USER XNAT_PASS \
-           S3_ADMIN_ACCESS_KEY S3_ADMIN_SECRET_KEY S3_BUCKET \
-           INTERNAL_DOMAIN SEAWEEDFS_HOSTNAME K0S_API_HOSTNAME \
-           KONNECTIVITY_HOSTNAME INGRESS_PORT AIS_DEID_HMAC_SALT; do
+REQUIRED_VARS=(
+    MGMT_NODE_IP XNAT_URL XNAT_USER XNAT_PASS
+    S3_ADMIN_ACCESS_KEY S3_ADMIN_SECRET_KEY S3_BUCKET
+    INTERNAL_DOMAIN SEAWEEDFS_HOSTNAME K0S_API_HOSTNAME
+    KONNECTIVITY_HOSTNAME INGRESS_PORT
+)
+if [ "${EDGE_ORTHANC_MODE:-managed}" != "external" ]; then
+    REQUIRED_VARS+=(AIS_DEID_HMAC_SALT)
+fi
+for var in "${REQUIRED_VARS[@]}"; do
     if [ -z "${!var:-}" ]; then
         echo "ERROR: ${var} is not set in config/management.env"
         [ "$var" = "AIS_DEID_HMAC_SALT" ] && echo "       Generate one with: openssl rand -hex 32"
@@ -180,24 +186,28 @@ if [ "${INSTALL_TOPOLOGY:-onprem}" = "cloud" ]; then
     # works on Nectar QLD topology — see docs/cloud-deployment.md.
 fi
 
-# Orthanc per-site config is edited by hand. Fail fast here rather than
-# 10 minutes into mgmt setup at step 07c.
-if [ ! -f "${SCRIPT_DIR}/config/orthanc/routing.json" ]; then
-    echo "ERROR: config/orthanc/routing.json not found"
-    echo "       Copy from the template and fill in AETMap:"
-    echo "         cp config/orthanc/routing.json.template config/orthanc/routing.json"
-    echo "         vim config/orthanc/routing.json"
-    exit 1
-fi
-# Deidentification profile must be filled in. Ships as a .template; the
-# Site admin copies it from the template and customises to the site's deid policy.
-if [ ! -f "${SCRIPT_DIR}/config/orthanc/deidentification-profile.json" ]; then
-    echo "ERROR: config/orthanc/deidentification-profile.json not found"
-    echo "       Copy the template and customise to your site's deid policy:"
-    echo "         cp config/orthanc/deidentification-profile.json.template \\"
-    echo "            config/orthanc/deidentification-profile.json"
-    echo "         vim config/orthanc/deidentification-profile.json"
-    exit 1
+if [ "${EDGE_ORTHANC_MODE:-managed}" != "external" ]; then
+    # Orthanc per-site config is edited by hand. Fail fast here rather than
+    # 10 minutes into mgmt setup at step 07c.
+    if [ ! -f "${SCRIPT_DIR}/config/orthanc/routing.json" ]; then
+        echo "ERROR: config/orthanc/routing.json not found"
+        echo "       Copy from the template and fill in AETMap:"
+        echo "         cp config/orthanc/routing.json.template config/orthanc/routing.json"
+        echo "         vim config/orthanc/routing.json"
+        exit 1
+    fi
+    # Deidentification profile must be filled in. Ships as a .template; the
+    # Site admin copies it from the template and customises to the site's deid policy.
+    if [ ! -f "${SCRIPT_DIR}/config/orthanc/deidentification-profile.json" ]; then
+        echo "ERROR: config/orthanc/deidentification-profile.json not found"
+        echo "       Copy the template and customise to your site's deid policy:"
+        echo "         cp config/orthanc/deidentification-profile.json.template \\"
+        echo "            config/orthanc/deidentification-profile.json"
+        echo "         vim config/orthanc/deidentification-profile.json"
+        exit 1
+    fi
+else
+    echo "EDGE_ORTHANC_MODE=external — skipping repo-managed Orthanc config validation."
 fi
 if [ ${#EDGE_NODES[@]} -eq 0 ]; then
     echo "ERROR: No edge nodes defined in config/edge-nodes.env"
@@ -236,10 +246,18 @@ echo "   03.  Deploy SeaweedFS (ClusterIP + TLS Ingress)"
 echo "   04.  Deploy XNAT upload pod (in-cluster: SeaweedFS → XNAT)"
 echo "   For each edge node:"
 echo "     05. Create hosted k0s control plane (with built-in Ingress)"
-echo "     06. Install k0s worker (sets /etc/hosts + patches CoreDNS)"
+if [ "${EDGE_JOIN_MODE:-ssh}" = "manual" ]; then
+    echo "     06a. Create local bootstrap bundle (manual edge join; no SSH)"
+else
+    echo "     06. Install k0s worker (sets /etc/hosts + patches CoreDNS)"
+fi
 echo "     07. Deploy xnat-ingest (sort in REST-pull mode + s3-uploader)"
 echo "     07b. Deploy Vector log shipper (skipped if observability disabled)"
-echo "     07c. Deploy Orthanc DICOM receiver + deid hook"
+if [ "${EDGE_ORTHANC_MODE:-managed}" = "external" ]; then
+    echo "     07c. Skip Orthanc deploy (EDGE_ORTHANC_MODE=external)"
+else
+    echo "     07c. Deploy Orthanc DICOM receiver + deid hook"
+fi
 echo ""
 echo "============================================"
 confirm "Proceed with installation? (y/N) "
@@ -333,9 +351,25 @@ for entry in "${EDGE_NODES[@]}"; do
     [[ $REPLY =~ ^[Ss]$ ]] || bash "${SCRIPT_DIR}/scripts/05-setup-edge-cluster.sh" "$entry"
 
     echo ""
-    echo "--- Step 06: Install k0s worker on ${ip} ---"
-    confirm "Run step 06 for ${name}? (y/s to skip) "
-    [[ $REPLY =~ ^[Ss]$ ]] || bash "${SCRIPT_DIR}/scripts/06-join-edge-worker.sh" "$entry"
+    if [ "${EDGE_JOIN_MODE:-ssh}" = "manual" ]; then
+        echo "--- Step 06a: Create local bootstrap bundle for ${name} ---"
+        confirm "Run step 06a for ${name}? (y/s to skip) "
+        [[ $REPLY =~ ^[Ss]$ ]] || bash "${SCRIPT_DIR}/scripts/06a-create-edge-bootstrap-bundle.sh" "$entry"
+
+        if KUBECONFIG="${SCRIPT_DIR}/kubeconfig-${name}" kubectl get nodes --no-headers 2>/dev/null | grep -q " Ready "; then
+            echo "Manual edge '${name}' already has a Ready node; continuing with workload deploy."
+        else
+            echo ""
+            echo "Manual join required for '${name}'. Transfer the bundle under secrets/ to the edge,"
+            echo "run ./bootstrap-rsl60.sh locally there, then re-run install.sh or steps 07/07b/07c."
+            echo "Skipping workload deploy for ${name} until its worker is Ready."
+            continue
+        fi
+    else
+        echo "--- Step 06: Install k0s worker on ${ip} ---"
+        confirm "Run step 06 for ${name}? (y/s to skip) "
+        [[ $REPLY =~ ^[Ss]$ ]] || bash "${SCRIPT_DIR}/scripts/06-join-edge-worker.sh" "$entry"
+    fi
 
     echo ""
     echo "--- Step 07: Deploy xnat-ingest on ${name} ---"
