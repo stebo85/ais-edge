@@ -21,6 +21,10 @@ ORTHANC_STORAGE_DIR="${EDGE_ORTHANC_STORAGE_DIR:-/data/orthanc-storage}"
 ORTHANC_LABEL="${EDGE_ORTHANC_LABEL:-xnat-ingest-ready}"
 ORTHANC_SKIP_LABEL="${EDGE_ORTHANC_SKIP_LABEL:-xnat-ingest-skip}"
 
+redact_url_userinfo() {
+    printf '%s' "$1" | sed -E 's#^(https?://)[^/@]+@#\1<redacted>@#'
+}
+
 if [[ "${PROJECT_ID}" == *REPLACE_WITH* ]] || [[ "${ORTHANC_URL}" == *REPLACE_WITH* ]]; then
     echo "ERROR: edge config still contains placeholder values." >&2
     echo "  PROJECT_ID=${PROJECT_ID}" >&2
@@ -114,7 +118,7 @@ elif [ -f "${REPO_DIR}/ais-edge-ca.crt" ]; then
 fi
 
 echo "=== 07: Complete for ${CLUSTER_NAME} ==="
-echo "Sort is in REST-pull mode against Orthanc: ${ORTHANC_URL}"
+echo "Sort is in REST-pull mode against Orthanc: $(redact_url_userinfo "${ORTHANC_URL}")"
 if [ "${EDGE_ORTHANC_MODE:-managed}" = "external" ]; then
     echo "Existing Orthanc mode: confirm rsl60's Orthanc is receiving DICOMs and exposes the storage mounted at ${ORTHANC_STORAGE_DIR} in the sort pod."
 else
