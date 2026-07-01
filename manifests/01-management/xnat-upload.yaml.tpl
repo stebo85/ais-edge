@@ -51,21 +51,96 @@ spec:
           # in config/management.env when upstream merges to switch back to
           # ghcr.io/australian-imaging-service/xnat-ingest:latest.
           image: {{XNAT_INGEST_IMAGE}}
-          command: ["xnat-ingest", "upload"]
+          command: ["/bin/sh", "-c"]
           args:
-            - "s3://{{S3_BUCKET}}/staged"
-            - "$(XINGEST_HOST)"
-            - "--always-include"
-            - "all"
-            - "--loop"
-            - "60"
-            - "--wait-period"
-            - "{{XNAT_UPLOAD_WAIT_PERIOD}}"
-            - "--dont-require-manifest"
-            - "--dont-verify-ssl"
-            - "--store-credentials"
-            - "$(S3_ACCESS_KEY)"
-            - "$(S3_SECRET_KEY)"
+            - |
+              set -eu
+              loop_seconds=60
+              wait_period="${XNAT_UPLOAD_WAIT_PERIOD:-300}"
+
+              archive_uploaded_sessions() {
+                python3 - "$wait_period" <<'PY'
+              import datetime
+              import os
+              import sys
+
+              import boto3
+
+              wait_period = int(sys.argv[1])
+              bucket = os.environ["S3_BUCKET"]
+              now = datetime.datetime.now(datetime.timezone.utc)
+              stamp = now.strftime("%Y%m%dT%H%M%SZ")
+
+              s3 = boto3.client(
+                  "s3",
+                  endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+                  aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+                  aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+                  region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+              )
+
+              def list_objects(prefix):
+                  objects = []
+                  paginator = s3.get_paginator("list_objects_v2")
+                  for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                      objects.extend(page.get("Contents", []))
+                  return objects
+
+              paginator = s3.get_paginator("list_objects_v2")
+              session_prefixes = []
+              for page in paginator.paginate(Bucket=bucket, Prefix="staged/", Delimiter="/"):
+                  session_prefixes.extend(p["Prefix"] for p in page.get("CommonPrefixes", []))
+
+              for prefix in session_prefixes:
+                  objects = list_objects(prefix)
+                  if not objects:
+                      continue
+                  latest = max(obj["LastModified"] for obj in objects)
+                  age = (now - latest).total_seconds()
+                  if age < wait_period:
+                      print(f"archive skip {prefix}: newest object age {age:.0f}s < {wait_period}s")
+                      continue
+
+                  session_name = prefix.removeprefix("staged/").rstrip("/")
+                  dest_prefix = f"uploaded/{stamp}/{session_name}/"
+
+                  for obj in objects:
+                      src_key = obj["Key"]
+                      dest_key = dest_prefix + src_key[len(prefix):]
+                      s3.copy_object(
+                          Bucket=bucket,
+                          CopySource={"Bucket": bucket, "Key": src_key},
+                          Key=dest_key,
+                      )
+
+                  for i in range(0, len(objects), 1000):
+                      batch = [{"Key": obj["Key"]} for obj in objects[i:i + 1000]]
+                      s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
+
+                  print(f"archived {prefix} to {dest_prefix} ({len(objects)} objects)")
+              PY
+              }
+
+              while true; do
+                start_ts=$(date +%s)
+                if xnat-ingest upload "s3://${S3_BUCKET}/staged" "${XINGEST_HOST}" \
+                    --always-include all \
+                    --wait-period "${wait_period}" \
+                    --dont-require-manifest \
+                    --dont-verify-ssl \
+                    --store-credentials "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}" \
+                    --raise-errors; then
+                  archive_uploaded_sessions
+                else
+                  echo "xnat-ingest upload failed; leaving staged data in place for retry" >&2
+                fi
+
+                elapsed=$(( $(date +%s) - start_ts ))
+                sleep_for=$(( loop_seconds - elapsed ))
+                [ "$sleep_for" -gt 0 ] || sleep_for=0
+                echo "xnat-upload loop took ${elapsed}s, sleeping ${sleep_for}s"
+                sleep "$sleep_for"
+              done
           env:
             - name: XINGEST_HOST
               valueFrom:
@@ -92,6 +167,10 @@ spec:
                 secretKeyRef:
                   name: s3-credentials
                   key: secret-key
+            - name: S3_BUCKET
+              value: "{{S3_BUCKET}}"
+            - name: XNAT_UPLOAD_WAIT_PERIOD
+              value: "{{XNAT_UPLOAD_WAIT_PERIOD}}"
             # Point boto3 at the in-cluster SeaweedFS service
             - name: AWS_ENDPOINT_URL
               value: "http://seaweedfs.seaweedfs.svc.cluster.local:8333"
