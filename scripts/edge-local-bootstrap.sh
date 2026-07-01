@@ -105,7 +105,11 @@ echo "k0s: $(k0s version)"
 
 if ! ${SUDO} systemctl is-active k0sworker >/dev/null 2>&1; then
     echo "Installing and starting k0s worker..."
-    ${SUDO} k0s install worker --force \
+    K0S_INSTALL_FORCE_ARGS=()
+    if ${SUDO} systemctl cat k0sworker >/dev/null 2>&1; then
+        K0S_INSTALL_FORCE_ARGS=(--force)
+    fi
+    ${SUDO} k0s install worker "${K0S_INSTALL_FORCE_ARGS[@]}" \
         --data-dir "${EDGE_K0S_DATA_DIR}" \
         --kubelet-root-dir "${EDGE_K0S_DATA_DIR}/kubelet" \
         --token-file /etc/k0s/join-token

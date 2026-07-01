@@ -13,10 +13,18 @@ if [ $# -lt 1 ]; then
 fi
 parse_edge_entry "$1"
 
+redact_url_userinfo() {
+    printf '%s' "$1" | sed -E 's#^(https?://)[^/@]+@#\1<redacted>@#'
+}
+
 if [ "${EDGE_ORTHANC_MODE:-managed}" = "external" ] || [ "${AIS_SKIP_ORTHANC_DEPLOY:-}" = "1" ]; then
     echo "=== 07c: Orthanc deploy — SKIPPED for ${CLUSTER_NAME} ==="
     echo "EDGE_ORTHANC_MODE=external means an existing Orthanc is expected at:"
-    echo "  ${EDGE_ORTHANC_URL:-<set EDGE_ORTHANC_URL in config/edge-nodes.env>}"
+    if [ -n "${EDGE_ORTHANC_URL:-}" ]; then
+        echo "  $(redact_url_userinfo "${EDGE_ORTHANC_URL}")"
+    else
+        echo "  <set EDGE_ORTHANC_URL in config/edge-nodes.env>"
+    fi
     exit 0
 fi
 

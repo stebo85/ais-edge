@@ -127,7 +127,11 @@ if ! sudo systemctl is-active k0sworker &>/dev/null; then
     sudo cp /tmp/join-token /etc/k0s/join-token
     sudo chmod 600 /etc/k0s/join-token
     rm -f /tmp/join-token
-    sudo k0s install worker --force \
+    K0S_INSTALL_FORCE_ARGS=()
+    if sudo systemctl cat k0sworker >/dev/null 2>&1; then
+        K0S_INSTALL_FORCE_ARGS=(--force)
+    fi
+    sudo k0s install worker "${K0S_INSTALL_FORCE_ARGS[@]}" \
         --data-dir "$EDGE_K0S_DATA_DIR" \
         --kubelet-root-dir "$EDGE_K0S_DATA_DIR/kubelet" \
         --token-file /etc/k0s/join-token
