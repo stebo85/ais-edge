@@ -49,6 +49,16 @@ rm -f "${OUT_DIR}/join-token" \
 cp "${REPO_DIR}/join-token-${CLUSTER_NAME}" "${OUT_DIR}/join-token"
 chmod 0600 "${OUT_DIR}/join-token"
 
+if [ -n "${K0S_API_HOSTNAME:-}" ] && [ -n "${INGRESS_PORT:-}" ]; then
+    NEW_URL="https://${K0S_API_HOSTNAME}:${INGRESS_PORT}"
+    TOKEN=$(base64 -d < "${OUT_DIR}/join-token" | gunzip \
+        | sed "s|server: .*|server: ${NEW_URL}|" \
+        | gzip | base64 -w0)
+    printf '%s\n' "$TOKEN" > "${OUT_DIR}/join-token"
+    chmod 0600 "${OUT_DIR}/join-token"
+    echo "Join token rewritten: server -> ${NEW_URL}"
+fi
+
 TMP_DIR=$(mktemp -d /tmp/ais-edge-bootstrap-XXXXXX)
 cleanup() { rm -rf "${TMP_DIR}"; }
 trap cleanup EXIT

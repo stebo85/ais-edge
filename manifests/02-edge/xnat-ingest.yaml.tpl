@@ -153,6 +153,10 @@ spec:
               value: "{{S3_BUCKET}}"
             - name: EDGE_NAME
               value: "{{CLUSTER_NAME}}"
+            - name: MC_MIRROR_MAX_WORKERS
+              value: "{{S3_UPLOAD_MAX_WORKERS}}"
+            - name: MC_MIRROR_LIMIT_UPLOAD
+              value: "{{S3_UPLOAD_LIMIT_UPLOAD}}"
             - name: S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
@@ -221,6 +225,9 @@ spec:
               done
               jlog alias_configured "" "mc alias set edge + bucket probe OK"
 
+              : "${MC_MIRROR_MAX_WORKERS:=2}"
+              : "${MC_MIRROR_LIMIT_UPLOAD:=80MiB}"
+
               while true; do
                 for session_dir in /data/staging/*/; do
                   session_name=$(basename "$session_dir")
@@ -272,6 +279,8 @@ spec:
                   jlog upload_started "$session_name" "" ",\"bytes\":${bytes},\"files\":${files},\"dicoms\":${dicoms}"
 
                   start_ts=$(date +%s)
+                  incoming_target="edge/${S3_BUCKET}/incoming/${EDGE_NAME}/${session_name}/"
+                  staged_target="edge/${S3_BUCKET}/staged/${session_name}/"
 
                   # Defence-in-depth: re-verify the alias is still good
                   # immediately before the mirror. If the S3 endpoint went
@@ -285,12 +294,28 @@ spec:
                   # mc mirror: rsync-for-S3. Multipart, parallel, resumable.
                   # --json makes mc itself emit one JSON line per object
                   # transferred, indexed by Vector alongside our own events.
-                  if mc --json mirror --overwrite "$session_dir" \
-                      "edge/${S3_BUCKET}/staged/${session_name}/"; then
-                    duration=$(( $(date +%s) - start_ts ))
-                    jlog upload_completed "$session_name" "" \
-                      ",\"bytes\":${bytes:-0},\"files\":${files:-0},\"dicoms\":${dicoms:-0},\"duration_s\":${duration}"
-                    rm -rf "$session_dir"
+                  #
+                  # Upload to an incoming prefix first. The management-side
+                  # xnat-ingest-upload pod watches only staged/, so it cannot
+                  # import a half-mirrored session. Once the incoming mirror
+                  # succeeds, publish to staged/ in a second remote-side pass.
+                  if mc --json mirror --overwrite --remove \
+                      --max-workers "${MC_MIRROR_MAX_WORKERS}" \
+                      --limit-upload "${MC_MIRROR_LIMIT_UPLOAD}" \
+                      "$session_dir" "$incoming_target"; then
+                    if mc --json mirror --overwrite --remove \
+                        --max-workers "${MC_MIRROR_MAX_WORKERS}" \
+                        "$incoming_target" "$staged_target"; then
+                      mc rm --recursive --force "$incoming_target" >/dev/null 2>&1 || true
+                      duration=$(( $(date +%s) - start_ts ))
+                      jlog upload_completed "$session_name" "" \
+                        ",\"bytes\":${bytes:-0},\"files\":${files:-0},\"dicoms\":${dicoms:-0},\"duration_s\":${duration}"
+                      rm -rf "$session_dir"
+                    else
+                      duration=$(( $(date +%s) - start_ts ))
+                      jlog upload_failed "$session_name" "publish from incoming to staged failed; preserving staged data for next retry" \
+                        ",\"bytes\":${bytes:-0},\"files\":${files:-0},\"dicoms\":${dicoms:-0},\"duration_s\":${duration}"
+                    fi
                   else
                     duration=$(( $(date +%s) - start_ts ))
                     jlog upload_failed "$session_name" "mc mirror non-zero exit; will retry next cycle" \

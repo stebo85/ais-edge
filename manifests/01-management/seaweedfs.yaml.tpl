@@ -80,6 +80,12 @@ spec:
             - { containerPort: 8080, name: volume }
             - { containerPort: 8888, name: filer }
             - { containerPort: 9324, name: metrics }
+          env:
+            # Keep Go's heap target below the pod limit. The all-in-one
+            # SeaweedFS process can briefly hold multipart upload buffers,
+            # filer metadata, and volume indexes at the same time.
+            - name: GOMEMLIMIT
+              value: "12GiB"
           volumeMounts:
             - name: data
               mountPath: /data
@@ -101,10 +107,10 @@ spec:
             periodSeconds: 30
           resources:
             requests:
-              memory: "512Mi"
+              memory: "2Gi"
               cpu: "250m"
             limits:
-              memory: "4Gi"
+              memory: "16Gi"
               cpu: "2000m"
       volumes:
         - name: data
