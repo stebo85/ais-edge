@@ -20,6 +20,8 @@ ORTHANC_URL="${EDGE_ORTHANC_URL:-http://orthanc.xnat-ingest.svc.cluster.local:80
 ORTHANC_STORAGE_DIR="${EDGE_ORTHANC_STORAGE_DIR:-/data/orthanc-storage}"
 ORTHANC_LABEL="${EDGE_ORTHANC_LABEL:-xnat-ingest-ready}"
 ORTHANC_SKIP_LABEL="${EDGE_ORTHANC_SKIP_LABEL:-xnat-ingest-skip}"
+S3_UPLOAD_MAX_WORKERS="${S3_UPLOAD_MAX_WORKERS:-2}"
+S3_UPLOAD_LIMIT_UPLOAD="${S3_UPLOAD_LIMIT_UPLOAD:-80MiB}"
 
 redact_url_userinfo() {
     printf '%s' "$1" | sed -E 's#^(https?://)[^/@]+@#\1<redacted>@#'
@@ -85,6 +87,8 @@ render_with_topology "${REPO_DIR}/manifests/02-edge/xnat-ingest.yaml.tpl" \
     INGEST_LOOP_SECONDS "$INGEST_LOOP_SECONDS" \
     INGEST_WAIT_PERIOD "$INGEST_WAIT_PERIOD" \
     EDGE_DATA_HOST_PATH "$EDGE_DATA_HOST_PATH" \
+    S3_UPLOAD_MAX_WORKERS "$S3_UPLOAD_MAX_WORKERS" \
+    S3_UPLOAD_LIMIT_UPLOAD "$S3_UPLOAD_LIMIT_UPLOAD" \
     ORTHANC_URL "$ORTHANC_URL" \
     ORTHANC_STORAGE_DIR "$ORTHANC_STORAGE_DIR" \
     ORTHANC_LABEL_ARGS "$ORTHANC_LABEL_ARGS" \
