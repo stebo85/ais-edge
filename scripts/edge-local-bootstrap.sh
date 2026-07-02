@@ -42,6 +42,7 @@ EDGE_ORTHANC_STORAGE_HOST_PATH="${EDGE_ORTHANC_STORAGE_HOST_PATH:-${EDGE_DATA_HO
 EDGE_K0S_DATA_DIR="${EDGE_K0S_DATA_DIR:-/data/k0s}"
 EDGE_SAMBA_UPLOAD_ENABLED="${EDGE_SAMBA_UPLOAD_ENABLED:-0}"
 EDGE_SAMBA_UPLOAD_HOST_PATH="${EDGE_SAMBA_UPLOAD_HOST_PATH:-${EDGE_DATA_HOST_PATH}/samba-upload}"
+EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH="${EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH:-${EDGE_SAMBA_UPLOAD_HOST_PATH}-done}"
 
 echo "=== AIS Edge local bootstrap: ${CLUSTER_NAME:-unknown} ==="
 echo "k0s worker data dir: ${EDGE_K0S_DATA_DIR}"
@@ -82,6 +83,13 @@ if [ "${EDGE_SAMBA_UPLOAD_ENABLED}" = "1" ]; then
         echo "Creating Samba XNAT upload drop path: ${EDGE_SAMBA_UPLOAD_HOST_PATH}"
         ${SUDO} mkdir -p "${EDGE_SAMBA_UPLOAD_HOST_PATH}"
         ${SUDO} chmod 777 "${EDGE_SAMBA_UPLOAD_HOST_PATH}"
+    fi
+    if [ -d "${EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH}" ]; then
+        echo "Samba XNAT upload archive path found: ${EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH}"
+    else
+        echo "Creating Samba XNAT upload archive path: ${EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH}"
+        ${SUDO} mkdir -p "${EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH}"
+        ${SUDO} chmod 777 "${EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH}"
     fi
 fi
 

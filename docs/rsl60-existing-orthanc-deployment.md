@@ -33,6 +33,7 @@ export EDGE_ORTHANC_STORAGE_DIR="/data/db-v6"
 export EDGE_K0S_DATA_DIR="/data/k0s"
 export EDGE_SAMBA_UPLOAD_ENABLED="1"
 export EDGE_SAMBA_UPLOAD_HOST_PATH="/local/samba/public/xnat-upload"
+export EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH="/local/samba/public/xnat-upload-done"
 export EDGE_SAMBA_UPLOAD_VISIT="samba_upload"
 ```
 
@@ -61,7 +62,9 @@ For example, files dropped under
 `/local/samba/public/xnat-upload/polimeni/openrecon/test/` are staged as the
 XNAT session `openrecon.test.samba_upload`, so the management upload pod
 imports them into the `openrecon` project for subject `test`. The files are
-placed under scan `1.SambaUpload`, resource `FILES`.
+placed under scan `1.SambaUpload`, resource `FILES`. After pickup, the
+original subject directory is moved out of the upload share and archived under
+`/local/samba/public/xnat-upload-done/polimeni/openrecon/test/`.
 
 If the existing Orthanc REST API requires HTTP Basic Auth, include credentials
 in `EDGE_ORTHANC_URL` using a secret-managed config file on the management
