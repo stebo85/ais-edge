@@ -255,28 +255,16 @@ spec:
               import datetime
               import os
               import sys
-              import tempfile
               import traceback
-              from pathlib import Path
 
               import boto3
               import xnat
-              from xnat_ingest.helpers.remotes import S3SessionListing
 
               wait_period = int(sys.argv[1])
               bucket = os.environ["S3_BUCKET"]
 
               def s3_client():
                   return boto3.client(
-                      "s3",
-                      endpoint_url=os.environ["AWS_ENDPOINT_URL"],
-                      aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-                      aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-                      region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-                  )
-
-              def s3_resource():
-                  return boto3.resource(
                       "s3",
                       endpoint_url=os.environ["AWS_ENDPOINT_URL"],
                       aws_access_key_id=os.environ["S3_ACCESS_KEY"],
@@ -308,11 +296,63 @@ spec:
                       batch = [{"Key": obj["Key"]} for obj in objects[i:i + 1000]]
                       s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
 
+              def session_ids(session_name):
+                  if "." in session_name:
+                      parts = session_name.split(".", 2)
+                  else:
+                      parts = session_name.split("-")[:3]
+                  if len(parts) < 3:
+                      raise ValueError(f"invalid staged session name {session_name!r}")
+                  project, subject, visit = parts[:3]
+                  return project, subject, visit, "_".join((subject, visit))
+
+              def expected_staged_file_count(objects, prefix):
+                  count = 0
+                  for obj in objects:
+                      rel_parts = obj["Key"][len(prefix):].split("/")
+                      if not rel_parts or rel_parts[-1] in {"", "MANIFEST.json", "METADATA.yaml"}:
+                          continue
+                      count += 1
+                  return count
+
+              def xnat_session_file_count(xsession):
+                  response = xsession.xnat_session.get(
+                      f"/data/experiments/{xsession.id}/scans/ALL/files?format=json",
+                      accepted_status=(200, 404),
+                  )
+                  if response.status_code == 404:
+                      return 0
+                  payload = response.json()
+                  rows = payload.get("ResultSet", {}).get("Result", [])
+                  return len(rows)
+
+              def staged_session_uploaded_with_files(connection, session_name, expected_count):
+                  project, _subject, _visit, xnat_session_id = session_ids(session_name)
+                  try:
+                      xproject = connection.projects[project]
+                  except KeyError:
+                      print(f"archive skip staged/{session_name}/: project {project!r} does not exist on XNAT")
+                      return False
+                  try:
+                      xsession = xproject.experiments[xnat_session_id]
+                  except KeyError:
+                      print(f"archive skip staged/{session_name}/: session {xnat_session_id!r} does not exist on XNAT")
+                      return False
+
+                  actual_count = xnat_session_file_count(xsession)
+                  if actual_count < expected_count:
+                      print(
+                          f"archive skip staged/{session_name}/: XNAT session file count "
+                          f"is incomplete ({actual_count}/{expected_count})"
+                      )
+                      return False
+
+                  return True
+
               def main():
                   now = datetime.datetime.now(datetime.timezone.utc)
                   stamp = now.strftime("%Y%m%dT%H%M%SZ")
                   s3 = s3_client()
-                  s3_bucket = s3_resource().Bucket(bucket)
 
                   paginator = s3.get_paginator("list_objects_v2")
                   session_prefixes = []
@@ -340,25 +380,22 @@ spec:
                               continue
 
                           session_name = prefix.removeprefix("staged/").rstrip("/")
-                          rel_objects = [
-                              (obj["Key"][len(prefix):].split("/"), None)
-                              for obj in objects
-                          ]
-                          listing = S3SessionListing(
-                              name=session_name,
-                              bucket=s3_bucket,
-                              objects=rel_objects,
-                              cache_path=Path(tempfile.gettempdir()) / session_name,
-                          )
+                          expected_count = expected_staged_file_count(objects, prefix)
+                          if not expected_count:
+                              print(f"archive skip {prefix}: no staged resource files found")
+                              continue
 
                           try:
-                              ready_to_archive = listing.all_uploaded(connection)
+                              ready_to_archive = staged_session_uploaded_with_files(
+                                  connection,
+                                  session_name,
+                                  expected_count,
+                              )
                           except Exception as exc:
                               print(f"archive skip {prefix}: XNAT uploaded check failed: {exc}")
                               continue
 
                           if not ready_to_archive:
-                              print(f"archive skip {prefix}: not all staged resources are present on XNAT")
                               continue
 
                           dest_prefix = f"uploaded/{stamp}/{session_name}/"
