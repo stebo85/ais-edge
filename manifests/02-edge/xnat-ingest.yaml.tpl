@@ -43,7 +43,7 @@ data:
       mkdir -p "${sort_output}"
 
       python3 /opt/ais-edge-sort-wrapper/stage-samba-uploads.py \
-        /samba-xnat-upload /data/staging || \
+        /samba-xnat-upload /data/staging /samba-xnat-upload-done || \
         echo "samba upload staging failed; continuing with DICOM sort loop" >&2
 
       python3 /opt/ais-edge-sort-wrapper/auto-label-studies.py "$@" || \
@@ -367,6 +367,7 @@ data:
 
     source_root = Path(sys.argv[1])
     publish_dir = Path(sys.argv[2])
+    archive_root = Path(sys.argv[3])
     wait_period = int(
         os.environ.get(
             "AIS_EDGE_SAMBA_UPLOAD_WAIT_PERIOD",
@@ -484,13 +485,14 @@ data:
         manifest = {"datatype": "generic/file-set", "checksums": checksums}
         (resource_dir / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
 
-    def write_metadata(session_tmp, group, project, subject):
+    def write_metadata(session_tmp, group, project, subject, archive_dest):
         metadata = {
             "Modality": modality,
             "Source": "samba-upload",
             "SourceGroup": group,
             "SourceProject": project,
             "SourceSubject": subject,
+            "SourceArchive": str(archive_dest),
         }
         (session_tmp / "METADATA.yaml").write_text(json.dumps(metadata, indent=2))
 
@@ -509,6 +511,34 @@ data:
             path = build_root / f"{prefix}.{stamp}.{counter}"
             counter += 1
         return path
+
+    def unique_archive_path(group, project, subject):
+        base_dir = archive_root / group / project
+        path = base_dir / subject
+        if not path.exists():
+            return path
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = base_dir / f"{subject}.{stamp}"
+        counter = 1
+        while path.exists():
+            path = base_dir / f"{subject}.{stamp}.{counter}"
+            counter += 1
+        return path
+
+    def copy_child(src, dest):
+        if src.is_dir():
+            shutil.copytree(str(src), str(dest), copy_function=shutil.copy2)
+        else:
+            shutil.copy2(str(src), str(dest))
+
+    def copy_subject_to_resource(source_tmp, resource_dir):
+        for child in source_tmp.iterdir():
+            copy_child(child, resource_dir / child.name)
+
+    def restore_source(source_tmp, subject_dir):
+        if source_tmp.exists() and not subject_dir.exists():
+            subject_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source_tmp), str(subject_dir))
 
     def stage_subject(group_dir, project_dir, subject_dir, snap):
         group = group_dir.name
@@ -541,20 +571,31 @@ data:
             return False, "pending"
 
         build_root.mkdir(parents=True, exist_ok=True)
+        archive_dest = unique_archive_path(group, raw_project, raw_subject)
         source_tmp = unique_build_path(f"source.{project}.{subject}")
         session_tmp = unique_build_path(f"session.{session_name}")
 
         shutil.move(str(subject_dir), str(source_tmp))
-        resource_dir = session_tmp / scan_dir_name / resource_name
-        resource_dir.mkdir(parents=True, exist_ok=True)
-        for child in source_tmp.iterdir():
-            shutil.move(str(child), str(resource_dir / child.name))
-        source_tmp.rmdir()
+        try:
+            archive_dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(str(source_tmp), str(archive_dest), copy_function=shutil.copy2)
 
-        write_manifest(resource_dir)
-        write_metadata(session_tmp, group, raw_project, raw_subject)
-        session_tmp.replace(target_dir)
-        prune_empty_source_dirs(subject_dir)
+            resource_dir = session_tmp / scan_dir_name / resource_name
+            resource_dir.mkdir(parents=True, exist_ok=True)
+            copy_subject_to_resource(source_tmp, resource_dir)
+            write_manifest(resource_dir)
+            write_metadata(session_tmp, group, raw_project, raw_subject, archive_dest)
+            session_tmp.replace(target_dir)
+        except Exception:
+            shutil.rmtree(session_tmp, ignore_errors=True)
+            if archive_dest.exists():
+                shutil.rmtree(archive_dest, ignore_errors=True)
+            restore_source(source_tmp, subject_dir)
+            raise
+        else:
+            shutil.rmtree(source_tmp)
+            prune_empty_source_dirs(subject_dir)
+
         log(
             "samba_session_staged",
             group=group,
@@ -564,6 +605,7 @@ data:
             files=snap["files"],
             bytes=snap["bytes"],
             source=str(source_root / group / raw_project / raw_subject),
+            archive=str(archive_dest),
             target=str(target_dir),
         )
         return True, "staged"
@@ -739,6 +781,8 @@ spec:
               mountPath: /data
             - name: samba-upload
               mountPath: /samba-xnat-upload
+            - name: samba-upload-done
+              mountPath: /samba-xnat-upload-done
             - name: sort-wrapper
               mountPath: /opt/ais-edge-sort-wrapper
               readOnly: true
@@ -750,6 +794,10 @@ spec:
         - name: samba-upload
           hostPath:
             path: {{EDGE_SAMBA_UPLOAD_HOST_PATH}}
+            type: DirectoryOrCreate
+        - name: samba-upload-done
+          hostPath:
+            path: {{EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH}}
             type: DirectoryOrCreate
         - name: sort-wrapper
           configMap:
