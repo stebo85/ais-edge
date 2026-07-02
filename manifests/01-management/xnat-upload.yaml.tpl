@@ -63,47 +63,46 @@ spec:
               import datetime
               import os
               import sys
+              import tempfile
+              import traceback
+              from pathlib import Path
 
               import boto3
+              import xnat
+              from xnat_ingest.helpers.remotes import S3SessionListing
 
               wait_period = int(sys.argv[1])
               bucket = os.environ["S3_BUCKET"]
-              now = datetime.datetime.now(datetime.timezone.utc)
-              stamp = now.strftime("%Y%m%dT%H%M%SZ")
 
-              s3 = boto3.client(
-                  "s3",
-                  endpoint_url=os.environ["AWS_ENDPOINT_URL"],
-                  aws_access_key_id=os.environ["S3_ACCESS_KEY"],
-                  aws_secret_access_key=os.environ["S3_SECRET_KEY"],
-                  region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-              )
+              def s3_client():
+                  return boto3.client(
+                      "s3",
+                      endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+                      aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+                      aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+                      region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+                  )
 
-              def list_objects(prefix):
+              def s3_resource():
+                  return boto3.resource(
+                      "s3",
+                      endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+                      aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+                      aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+                      region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+                  )
+
+              def list_objects(s3, prefix):
                   objects = []
                   paginator = s3.get_paginator("list_objects_v2")
                   for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-                      objects.extend(page.get("Contents", []))
+                      objects.extend(
+                          obj for obj in page.get("Contents", [])
+                          if not obj["Key"].endswith("/")
+                      )
                   return objects
 
-              paginator = s3.get_paginator("list_objects_v2")
-              session_prefixes = []
-              for page in paginator.paginate(Bucket=bucket, Prefix="staged/", Delimiter="/"):
-                  session_prefixes.extend(p["Prefix"] for p in page.get("CommonPrefixes", []))
-
-              for prefix in session_prefixes:
-                  objects = list_objects(prefix)
-                  if not objects:
-                      continue
-                  latest = max(obj["LastModified"] for obj in objects)
-                  age = (now - latest).total_seconds()
-                  if age < wait_period:
-                      print(f"archive skip {prefix}: newest object age {age:.0f}s < {wait_period}s")
-                      continue
-
-                  session_name = prefix.removeprefix("staged/").rstrip("/")
-                  dest_prefix = f"uploaded/{stamp}/{session_name}/"
-
+              def archive_objects(s3, prefix, objects, dest_prefix):
                   for obj in objects:
                       src_key = obj["Key"]
                       dest_key = dest_prefix + src_key[len(prefix):]
@@ -117,22 +116,84 @@ spec:
                       batch = [{"Key": obj["Key"]} for obj in objects[i:i + 1000]]
                       s3.delete_objects(Bucket=bucket, Delete={"Objects": batch})
 
-                  print(f"archived {prefix} to {dest_prefix} ({len(objects)} objects)")
+              def main():
+                  now = datetime.datetime.now(datetime.timezone.utc)
+                  stamp = now.strftime("%Y%m%dT%H%M%SZ")
+                  s3 = s3_client()
+                  s3_bucket = s3_resource().Bucket(bucket)
+
+                  paginator = s3.get_paginator("list_objects_v2")
+                  session_prefixes = []
+                  for page in paginator.paginate(Bucket=bucket, Prefix="staged/", Delimiter="/"):
+                      session_prefixes.extend(p["Prefix"] for p in page.get("CommonPrefixes", []))
+
+                  if not session_prefixes:
+                      print("archive skip staged/: no staged session prefixes found")
+                      return
+
+                  with xnat.connect(
+                      os.environ["XINGEST_HOST"],
+                      user=os.environ["XINGEST_USER"],
+                      password=os.environ["XINGEST_PASS"],
+                      verify=False,
+                  ) as connection:
+                      for prefix in session_prefixes:
+                          objects = list_objects(s3, prefix)
+                          if not objects:
+                              continue
+                          latest = max(obj["LastModified"] for obj in objects)
+                          age = (now - latest).total_seconds()
+                          if age < wait_period:
+                              print(f"archive skip {prefix}: newest object age {age:.0f}s < {wait_period}s")
+                              continue
+
+                          session_name = prefix.removeprefix("staged/").rstrip("/")
+                          rel_objects = [
+                              (obj["Key"][len(prefix):].split("/"), None)
+                              for obj in objects
+                          ]
+                          listing = S3SessionListing(
+                              name=session_name,
+                              bucket=s3_bucket,
+                              objects=rel_objects,
+                              cache_path=Path(tempfile.gettempdir()) / session_name,
+                          )
+
+                          try:
+                              ready_to_archive = listing.all_uploaded(connection)
+                          except Exception as exc:
+                              print(f"archive skip {prefix}: XNAT uploaded check failed: {exc}")
+                              continue
+
+                          if not ready_to_archive:
+                              print(f"archive skip {prefix}: not all staged resources are present on XNAT")
+                              continue
+
+                          dest_prefix = f"uploaded/{stamp}/{session_name}/"
+                          archive_objects(s3, prefix, objects, dest_prefix)
+                          print(f"archived {prefix} to {dest_prefix} ({len(objects)} objects)")
+
+              try:
+                  main()
+              except Exception as exc:
+                  print(f"archive check failed: {exc}", file=sys.stderr)
+                  traceback.print_exc()
               PY
               }
 
               while true; do
                 start_ts=$(date +%s)
+                archive_uploaded_sessions
                 if xnat-ingest upload "s3://${S3_BUCKET}/staged" "${XINGEST_HOST}" \
                     --always-include all \
                     --wait-period "${wait_period}" \
                     --dont-require-manifest \
                     --dont-verify-ssl \
-                    --store-credentials "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}" \
-                    --raise-errors; then
+                    --store-credentials "${S3_ACCESS_KEY}" "${S3_SECRET_KEY}"; then
                   archive_uploaded_sessions
                 else
-                  echo "xnat-ingest upload failed; leaving staged data in place for retry" >&2
+                  echo "xnat-ingest upload failed before completing the staged scan; archiving only sessions already complete in XNAT" >&2
+                  archive_uploaded_sessions
                 fi
 
                 elapsed=$(( $(date +%s) - start_ts ))
