@@ -40,6 +40,8 @@ EDGE_DATA_HOST_PATH="${EDGE_DATA_HOST_PATH:-/data/xnat-ingest}"
 EDGE_ORTHANC_MODE="${EDGE_ORTHANC_MODE:-managed}"
 EDGE_ORTHANC_STORAGE_HOST_PATH="${EDGE_ORTHANC_STORAGE_HOST_PATH:-${EDGE_DATA_HOST_PATH}/orthanc-storage}"
 EDGE_K0S_DATA_DIR="${EDGE_K0S_DATA_DIR:-/data/k0s}"
+EDGE_SAMBA_UPLOAD_ENABLED="${EDGE_SAMBA_UPLOAD_ENABLED:-0}"
+EDGE_SAMBA_UPLOAD_HOST_PATH="${EDGE_SAMBA_UPLOAD_HOST_PATH:-${EDGE_DATA_HOST_PATH}/samba-upload}"
 
 echo "=== AIS Edge local bootstrap: ${CLUSTER_NAME:-unknown} ==="
 echo "k0s worker data dir: ${EDGE_K0S_DATA_DIR}"
@@ -73,6 +75,15 @@ fi
 echo "Preparing edge data directories..."
 ${SUDO} mkdir -p "${EDGE_DATA_HOST_PATH}/staging"
 ${SUDO} chmod 777 "${EDGE_DATA_HOST_PATH}/staging"
+if [ "${EDGE_SAMBA_UPLOAD_ENABLED}" = "1" ]; then
+    if [ -d "${EDGE_SAMBA_UPLOAD_HOST_PATH}" ]; then
+        echo "Samba XNAT upload drop path found: ${EDGE_SAMBA_UPLOAD_HOST_PATH}"
+    else
+        echo "Creating Samba XNAT upload drop path: ${EDGE_SAMBA_UPLOAD_HOST_PATH}"
+        ${SUDO} mkdir -p "${EDGE_SAMBA_UPLOAD_HOST_PATH}"
+        ${SUDO} chmod 777 "${EDGE_SAMBA_UPLOAD_HOST_PATH}"
+    fi
+fi
 
 case "${EDGE_ORTHANC_MODE}" in
     external)

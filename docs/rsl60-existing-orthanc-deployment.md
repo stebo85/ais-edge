@@ -31,6 +31,9 @@ export EDGE_DATA_HOST_PATH="/local/orthanc"
 export EDGE_ORTHANC_STORAGE_HOST_PATH="/local/orthanc/db-v6"
 export EDGE_ORTHANC_STORAGE_DIR="/data/db-v6"
 export EDGE_K0S_DATA_DIR="/data/k0s"
+export EDGE_SAMBA_UPLOAD_ENABLED="1"
+export EDGE_SAMBA_UPLOAD_HOST_PATH="/local/samba/public/xnat-upload"
+export EDGE_SAMBA_UPLOAD_VISIT="samba_upload"
 ```
 
 The existing Orthanc storage must be visible to the sort pod at
@@ -46,6 +49,19 @@ On the current rsl60 host, Orthanc stores DICOM data under
 directory as `/data`, see Orthanc storage at `/data/db-v6`, and create AIS
 staging at `/data/staging` (`/local/orthanc/staging` on the host). Use
 `/data/k0s` only for k0s/container runtime state.
+
+With `EDGE_SAMBA_UPLOAD_ENABLED=1`, the sort pod also scans
+`/local/samba/public/xnat-upload` on rsl60. The expected layout is:
+
+```text
+/local/samba/public/xnat-upload/<group>/<project>/<subject>/
+```
+
+For example, files dropped under
+`/local/samba/public/xnat-upload/polimeni/openrecon/test/` are staged as the
+XNAT session `openrecon.test.samba_upload`, so the management upload pod
+imports them into the `openrecon` project for subject `test`. The files are
+placed under scan `1.SambaUpload`, resource `FILES`.
 
 If the existing Orthanc REST API requires HTTP Basic Auth, include credentials
 in `EDGE_ORTHANC_URL` using a secret-managed config file on the management
