@@ -13,6 +13,7 @@ kubectl create namespace xnat-upload --dry-run=client -o yaml | kubectl apply -f
 XNAT_INTERNAL_URL="${XNAT_INTERNAL_URL:-http://xnat-web.ais-xnat.svc.cluster.local}"
 XNAT_UPLOAD_URL="${XNAT_UPLOAD_URL:-$XNAT_URL}"
 XNAT_UPLOAD_WAIT_PERIOD="${XNAT_UPLOAD_WAIT_PERIOD:-300}"
+XNAT_PROJECT_ADMIN_USERS="${XNAT_PROJECT_ADMIN_USERS:-brosnan,sciget}"
 
 if [[ -n "${XNAT_USER:-}" && -n "${XNAT_PASS:-}" ]]; then
     kubectl create secret generic xnat-token-source \
@@ -43,6 +44,7 @@ render "${REPO_DIR}/manifests/01-management/xnat-upload.yaml.tpl" \
     S3_ADMIN_SECRET_KEY "$S3_ADMIN_SECRET_KEY" \
     S3_BUCKET "$S3_BUCKET" \
     XNAT_UPLOAD_WAIT_PERIOD "$XNAT_UPLOAD_WAIT_PERIOD" \
+    XNAT_PROJECT_ADMIN_USERS "$XNAT_PROJECT_ADMIN_USERS" \
     XNAT_INGEST_IMAGE "${XNAT_INGEST_IMAGE:-ghcr.io/australian-imaging-service/xnat-ingest:latest}" \
     | kubectl apply -f -
 

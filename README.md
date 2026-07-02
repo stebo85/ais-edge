@@ -638,7 +638,8 @@ Before ingesting data, ensure:
 1. **XNAT project exists** — create it in the XNAT web UI before uploading.
    The project ID must match `PROJECT_ID` in `config/edge-nodes.env`.
 2. **XNAT user is a local account** — not AAF/OIDC. Create via Administer → Users.
-3. **XNAT user has project permissions** — at least Member or Collaborator on the target project.
+3. **XNAT user has project permissions** — at least Member or Collaborator on the target project, and enough rights to manage project users if automatic owner assignment is enabled.
+4. **Project owner sync** — the management upload pod adds every username in `XNAT_PROJECT_ADMIN_USERS` to the XNAT `Owners` group for every visible project before and after each upload pass. The default is `brosnan,sciget`, so projects created by the uploader are picked up on the same loop.
 
 xnat-ingest authenticates via `POST /data/JSESSION` with username/password and uses the
 session token for all subsequent REST API calls.
