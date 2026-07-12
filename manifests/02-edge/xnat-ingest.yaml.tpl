@@ -496,13 +496,6 @@ data:
         }
         (session_tmp / "METADATA.yaml").write_text(json.dumps(metadata, indent=2))
 
-    def prune_empty_source_dirs(subject_dir):
-        for path in (subject_dir.parent, subject_dir.parent.parent):
-            try:
-                path.rmdir()
-            except OSError:
-                return
-
     def unique_build_path(prefix):
         stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         path = build_root / f"{prefix}.{stamp}"
@@ -594,7 +587,8 @@ data:
             raise
         else:
             shutil.rmtree(source_tmp)
-            prune_empty_source_dirs(subject_dir)
+            # Leave the (now empty) group/project directories in place so
+            # uploaders keep a stable folder structure to drop data into.
 
         log(
             "samba_session_staged",
