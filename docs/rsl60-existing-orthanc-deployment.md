@@ -64,7 +64,9 @@ XNAT session `openrecon.test.samba_upload`, so the management upload pod
 imports them into the `openrecon` project for subject `test`. The files are
 placed under scan `1.SambaUpload`, resource `FILES`. After pickup, the
 original subject directory is moved out of the upload share and archived under
-`/local/samba/public/xnat-upload-done/polimeni/openrecon/test/`.
+`/local/samba/public/xnat-upload-done/polimeni/openrecon/test/`; the now-empty
+`<group>/<project>` directories are left in place in the upload share so the
+drop-off folder structure stays put.
 
 If the existing Orthanc REST API requires HTTP Basic Auth, include credentials
 in `EDGE_ORTHANC_URL` using a secret-managed config file on the management
