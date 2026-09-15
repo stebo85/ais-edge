@@ -68,6 +68,19 @@ original subject directory is moved out of the upload share and archived under
 `<group>/<project>` directories are left in place in the upload share so the
 drop-off folder structure stays put.
 
+rsl60 sets `EDGE_SAMBA_UPLOAD_ALLOWED_PROJECTS=""`, admitting every new raw
+project without a DICOM study or a manual allow-list change. After the normal
+quiet period, `<group>/<project>/<subject>/` is staged, the central provisioner
+creates the project, and the existing XNAT user matching `<group>` is requested
+and verified as an Owner using `SourceGroup` metadata. Unknown users are logged
+as deferred; this does not create user accounts. An empty folder alone does not
+trigger an upload or project creation.
+
+To restrict admission, configure a nonempty comma-separated raw project list.
+Routed Orthanc projects extend that list and are cached on the edge. An explicitly
+empty value must remain empty during deployment; only an unset variable inherits
+`EDGE_AUTO_IMPORT_ALLOWED_PROJECTS`.
+
 If the existing Orthanc REST API requires HTTP Basic Auth, include credentials
 in `EDGE_ORTHANC_URL` using a secret-managed config file on the management
 host, for example `http://<user>:<pass>@<rsl60-host>:8042`.
