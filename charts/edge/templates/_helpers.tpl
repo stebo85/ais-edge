@@ -35,6 +35,39 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/* Catching them at `helm template` time is the whole point.             */}}
 {{/* ===================================================================== */}}
 {{- define "edge.validate" -}}
+  {{- if not .Values.orthanc.enabled }}
+    {{- if and .Values.ingest.orthancGroup.enabled (not .Values.orthanc.externalUrl) }}
+      {{- fail "orthanc.enabled=false requires orthanc.externalUrl when grouping is enabled" }}
+    {{- end }}
+    {{- if ne (include "edge.deidEngine" .) "none" }}
+      {{- fail "external Orthanc requires deid.engine=none and upstream de-identification; the managed Lua archive is unavailable" }}
+    {{- end }}
+  {{- end }}
+  {{- if .Values.ingest.stanford.enabled }}
+    {{- if ne (include "edge.deidEngine" .) "none" }}
+      {{- fail "ingest.stanford.enabled requires deid.engine=none: Stanford receives data de-identified upstream" }}
+    {{- end }}
+    {{- if or .Values.ingest.fileDrop.enabled .Values.ingest.associate.enabled }}
+      {{- fail "Stanford ingestion cannot run alongside fileDrop or associate stages" }}
+    {{- end }}
+    {{- if not (regexMatch "^[A-Za-z0-9_]+$" .Values.ingest.stanford.fallbackProject) }}
+      {{- fail "ingest.stanford.fallbackProject must be a nonempty XNAT project ID" }}
+    {{- end }}
+    {{- if lt (int .Values.ingest.stanford.routing.batchSize) 1 }}
+      {{- fail "ingest.stanford.routing.batchSize must be positive" }}
+    {{- end }}
+    {{- if .Values.ingest.stanford.rawUploads.enabled }}
+      {{- if or (not (hasPrefix "/" .Values.ingest.stanford.rawUploads.hostPath)) (not (hasPrefix "/" .Values.ingest.stanford.rawUploads.archiveHostPath)) (eq .Values.ingest.stanford.rawUploads.hostPath .Values.ingest.stanford.rawUploads.archiveHostPath) }}
+        {{- fail "Stanford raw uploads need distinct absolute hostPath and archiveHostPath" }}
+      {{- end }}
+      {{- if or (not (regexMatch "^[A-Za-z0-9_.-]+$" .Values.ingest.stanford.rawUploads.scan)) (has .Values.ingest.stanford.rawUploads.scan (list "." "..")) (not (regexMatch "^[A-Za-z0-9_-]+$" .Values.ingest.stanford.rawUploads.resource)) }}
+        {{- fail "Stanford raw scan and resource must be single safe directory names" }}
+      {{- end }}
+      {{- if lt (int .Values.ingest.stanford.rawUploads.waitPeriod) 0 }}
+        {{- fail "Stanford raw waitPeriod cannot be negative" }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
   {{- /* A GUARD MUST BE GATED ON WHAT CONSUMES THE VALUE, not on the section
          heading the value sits under. Both of these live beneath `orthanc:` and
          both were gated on deid.engine=orthanc; neither value is consumed on that
@@ -750,6 +783,10 @@ originals.quarantine	original	{{ printf "%s/%s" (trimSuffix "/" .Values.dataPoli
 {{- if .Values.ingest.fileDrop.enabled }}
 originals.fileDrop	original	{{ .Values.dataPolicy.originals.fileDrop.location }}	-	-	{{ .Values.dataPolicy.originals.fileDrop.reclaim }}	{{ include "edge.durationSeconds" .Values.dataPolicy.originals.fileDrop.minAge }}	filesystem
 {{- end }}
+{{- if and .Values.ingest.stanford.enabled .Values.ingest.stanford.rawUploads.enabled }}
+originals.stanfordRaw	original	/stanford-upload	-	-	forever	-	filesystem
+originals.stanfordRawArchive	original	/stanford-upload-done	-	-	forever	-	filesystem
+{{- end }}
 derived.orthancStorage	derived	{{ .Values.dataPolicy.derived.orthancStorage.location }}	-	-	{{ .Values.dataPolicy.derived.orthancStorage.reclaim }}	{{ include "edge.durationSeconds" .Values.dataPolicy.derived.orthancStorage.minAge }}	{{ .Values.dataPolicy.derived.orthancStorage.backend }}
 derived.grouped	derived	{{ .Values.dataPolicy.derived.grouped.location }}	-	-	{{ .Values.dataPolicy.derived.grouped.reclaim }}	0	filesystem
 derived.assigned	derived	{{ .Values.dataPolicy.derived.assigned.location }}	-	-	{{ include "edge.assignedReclaim" . }}	{{ include "edge.durationSeconds" .Values.dataPolicy.derived.assigned.minAge }}	filesystem
@@ -847,3 +884,11 @@ before.
 {{- define "edge.uploadReclaim" -}}
 {{- if (eq (include "edge.deidEngine" .) "ingest") }}{{ include "edge.deidentifiedReclaim" . }}{{- else }}{{ include "edge.assignedReclaim" . }}{{- end }}
 {{- end }}
+
+{{- define "edge.orthancUrl" -}}
+{{- if .Values.orthanc.enabled -}}
+http://{{ include "edge.fullname" . }}-orthanc.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.orthanc.httpPort }}
+{{- else -}}
+{{- .Values.orthanc.externalUrl -}}
+{{- end -}}
+{{- end -}}

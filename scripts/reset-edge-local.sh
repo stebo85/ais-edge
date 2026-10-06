@@ -35,7 +35,7 @@
 # NOT REMOVED, DELIBERATELY
 #   /usr/local/bin/k0s   a rejoin reuses it; removing it only forces a download
 #   microk8s             predates this deployment, not ours to remove
-#   /data*               no edge data path is touched at all
+#   /data*               imaging data is untouched; /data/k0s is runtime only
 #   Docker / CTP         k0s runs its own containerd on /run/k0s/containerd.sock
 #   iptables             never flushed; `k0s reset` removes only k0s's own rules
 #
@@ -52,7 +52,12 @@ esac
 
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 MARKER="# ais-edge phase2 tls hostnames"
-K0S_DIR=/var/lib/k0s          # edge-join.sh passes no --data-dir, so this is it
+K0S_DIR="${EDGE_K0S_DATA_DIR:-/var/lib/k0s}"
+# This script recursively removes runtime state; accept only the shipped paths.
+case "$K0S_DIR" in
+    /var/lib/k0s|/data/k0s) ;;
+    *) echo "ERROR: unsupported EDGE_K0S_DATA_DIR for reset: $K0S_DIR" >&2; exit 1 ;;
+esac
 RC=0
 STAMP="/tmp/edge-reset-$(hostname -s)-$(date +%Y%m%d-%H%M%S)"
 $DRY || mkdir -p "$STAMP"
@@ -136,9 +141,9 @@ fi
 # ---------------------------------------------------------------------------
 hdr "3. k0s reset"
 # ---------------------------------------------------------------------------
-# No --data-dir: edge-join.sh does not pass one, so the default is correct.
+# Reset the same runtime store selected when the worker was joined.
 act "k0s reset   (removes k0s's own containerd state and iptables rules)" -- \
-    bash -c "$SUDO k0s reset 2>&1 | sed 's/^/         /'; true"
+    bash -c "$SUDO k0s reset --data-dir '$K0S_DIR' 2>&1 | sed 's/^/         /'; true"
 
 # `k0s reset` deletes the unit FILE but systemd keeps the unit in `failed` state
 # in memory — observed on cai-lfs3, where the post-reset check still reported

@@ -1,0 +1,71 @@
+# Fill the management address and edge address before installation.
+clusterLabel: stanford
+installMode: existing
+topology: onprem
+domain:
+  internal: aisedge.local
+  mgmtNodeIP: REPLACE_WITH_MGMT_IP
+certManager:
+  enabled: false
+k0smotron:
+  enabled: true
+edges:
+  - name: edge-rsl60
+    nodeIP: REPLACE_WITH_RSL60_IP
+    exposure: nodePort
+    apiNodePort: 30443
+    konnectivityNodePort: 30132
+    join: bundle
+    workerDataDir: /data/k0s
+    bucket: ingest-bucket
+    s3SecretRef: edge-rsl60-s3
+seaweedfs:
+  perSiteBuckets: true
+xnatUpload:
+  waitPeriod: 300
+  archivePrefix: uploaded
+  projectProvisioning:
+    enabled: true
+    sourceGroupOwner: true
+    ownerUsers: [brosnan, sciget]
+  tokenRefresh:
+    enabled: true
+    sourceSecretRef: xnat-token-source
+certSync:
+  secrets:
+    - source:
+        namespace: cert-manager
+        name: ais-edge-ca-secret
+        keys: {ca.crt: ca.crt}
+      destination:
+        namespace: xnat-ingest
+        name: ca-bundle
+        type: Opaque
+    - source:
+        namespace: ais-mgmt
+        name: "<edge>-loki-client"
+        keys: {tls.crt: tls.crt, tls.key: tls.key}
+      destination:
+        namespace: xnat-ingest
+        name: loki-push-client-tls
+        type: kubernetes.io/tls
+    - source:
+        namespace: ais-mgmt
+        name: "<edge>-s3"
+        keys: {access-key: access-key, secret-key: secret-key}
+      destination:
+        namespace: xnat-ingest
+        name: s3-edge-credentials
+        type: Opaque
+observability:
+  alerting:
+    emailFrom: REPLACE_ALERT_SENDER
+    emailTo: REPLACE_ALERT_RECIPIENT
+    smtpHost: REPLACE_SMTP_HOST
+dataPolicy:
+  enabled: true
+  dryRun: false
+  derived:
+    s3Staged:
+      minAge: 5m
+      schedule: "*/5 * * * *"

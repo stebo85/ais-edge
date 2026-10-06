@@ -157,7 +157,7 @@ spec:
                    the adapter and group-orthanc cannot end up pointed at
                    different Orthancs. */}}
             - name: ORTHANC_URL
-              value: "http://{{ include "edge.fullname" . }}-orthanc.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.orthanc.httpPort }}"
+              value: {{ include "edge.orthancUrl" . | quote }}
             - name: ORTHANC_PROCESSED_LABEL
               value: {{ .Values.ingest.orthancGroup.processedLabel | quote }}
             {{- if .Values.orthanc.auth.enabled }}
@@ -205,6 +205,10 @@ spec:
                    enforces it rather than the script's own check. */}}
             - {name: facility-backup, mountPath: /facility-backup, readOnly: {{ not (and $armed .Values.dataPolicy.originals.allowExpiry) }}}
             {{- end }}
+            {{- if and .Values.ingest.stanford.enabled .Values.ingest.stanford.rawUploads.enabled }}
+            - {name: raw-upload, mountPath: /stanford-upload, readOnly: true}
+            - {name: raw-archive, mountPath: /stanford-upload-done, readOnly: true}
+            {{- end }}
           resources:
             {{- toYaml .Values.dataPolicy.reporter.resources | nindent 12 }}
       volumes:
@@ -217,5 +221,15 @@ spec:
         {{- if .Values.storage.facilityBackup.enabled }}
         - name: facility-backup
           persistentVolumeClaim: {claimName: {{ include "edge.facilityBackupPvc" . }}}
+        {{- end }}
+        {{- if and .Values.ingest.stanford.enabled .Values.ingest.stanford.rawUploads.enabled }}
+        - name: raw-upload
+          hostPath:
+            path: {{ .Values.ingest.stanford.rawUploads.hostPath | quote }}
+            type: Directory
+        - name: raw-archive
+          hostPath:
+            path: {{ .Values.ingest.stanford.rawUploads.archiveHostPath | quote }}
+            type: Directory
         {{- end }}
 {{- end }}

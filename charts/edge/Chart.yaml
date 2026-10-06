@@ -7,7 +7,7 @@ description: >-
 type: application
 
 # Chart version. Bump on every change to the templates or default values.
-version: 0.5.1
+version: 0.6.0
 
 # Version of xnat-ingest this chart's pipeline arguments are written against.
 # The CLI changed shape at 0.12 (sort -> group-orthanc + assign), so this is

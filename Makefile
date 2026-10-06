@@ -42,7 +42,7 @@ export CI_TOOL_DIR ?= $(HOME)/.cache/ais-edge-ci/bin
 # The stages that need no cluster and no docker. THE ORDER IS LOAD-BEARING:
 # `render` is first because the three stages that read $(CI_RENDER_DIR) are
 # after it.
-FAST_STAGES := render negative promtool shell-syntax lua-syntax fingerprint-contract shared-files cli-contract pvc-retention runtime-templates duplicate-names reclaimer secret-contract values-consumers
+FAST_STAGES := render negative promtool shell-syntax lua-syntax fingerprint-contract shared-files cli-contract pvc-retention runtime-templates duplicate-names reclaimer secret-contract values-consumers stanford
 ALL_STAGES  := $(FAST_STAGES) loki-rules data-policy greenfield
 
 # Prerequisite that makes `make promtool` on its own render first. run-stages
@@ -196,3 +196,6 @@ help:
 	@echo '  CI_REQUIRE_DATAPOLICY_TESTS=1  a skipped data-policy stage is a failure'
 	@echo '  CI_REQUIRE_RULE_TESTS=1  a rule file with no promtool test is a failure'
 	@echo '  CI_KIND_KEEP=1           leave the kind cluster up for inspection'
+
+stanford:
+	@tests/stanford/run-tests.sh

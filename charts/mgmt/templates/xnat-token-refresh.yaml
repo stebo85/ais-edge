@@ -1,0 +1,97 @@
+{{- if and .Values.xnatUpload.enabled .Values.xnatUpload.tokenRefresh.enabled }}
+{{- $name := printf "%s-xnat-token-refresh" (include "mgmt.fullname" .) }}
+{{- $deployments := list }}
+{{- range .Values.edges }}
+{{- $deployments = append $deployments (printf "%s-upload-%s" (include "mgmt.fullname" $) .name) }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.xnatUpload.namespace }}
+data:
+  xnat-token-refresh.py: |
+    {{- .Files.Get "files/xnat-token-refresh.py" | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.xnatUpload.namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.xnatUpload.namespace }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [{{ .Values.xnatUpload.xnatSecretRef | quote }}]
+    verbs: [get, patch, update]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: {{ toJson $deployments }}
+    verbs: [get, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.xnatUpload.namespace }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Values.xnatUpload.namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.xnatUpload.namespace }}
+spec:
+  schedule: {{ .Values.xnatUpload.tokenRefresh.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 300
+      template:
+        spec:
+          serviceAccountName: {{ $name }}
+          restartPolicy: Never
+          containers:
+            - name: refresh
+              image: "{{ .Values.xnatUpload.image.repository }}:{{ .Values.xnatUpload.image.tag }}"
+              command: [python3, /etc/stanford/xnat-token-refresh.py]
+              env:
+                - name: POD_NAMESPACE
+                  value: {{ .Values.xnatUpload.namespace | quote }}
+                - name: XNAT_TARGET_SECRET
+                  value: {{ .Values.xnatUpload.xnatSecretRef | quote }}
+                - name: XNAT_UPLOAD_SERVER
+                  value: {{ .Values.xnatUpload.tokenRefresh.uploadServer | quote }}
+                - name: UPLOAD_DEPLOYMENTS
+                  value: {{ toJson $deployments | quote }}
+                - name: XNAT_VERIFY_SSL
+                  value: {{ .Values.xnatUpload.verifySsl | quote }}
+                {{- range $entry := list (dict "env" "XNAT_SOURCE_SERVER" "key" "server") (dict "env" "XNAT_SOURCE_USER" "key" "username") (dict "env" "XNAT_SOURCE_PASS" "key" "password") }}
+                - name: {{ $entry.env }}
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ $.Values.xnatUpload.tokenRefresh.sourceSecretRef }}
+                      key: {{ $entry.key }}
+                {{- end }}
+              volumeMounts:
+                - {name: script, mountPath: /etc/stanford, readOnly: true}
+          volumes:
+            - name: script
+              configMap:
+                name: {{ $name }}
+{{- end }}

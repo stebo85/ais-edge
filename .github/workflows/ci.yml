@@ -148,6 +148,10 @@ jobs:
       # version in docker and evaluate the REAL rule expressions against fixture
       # logs — the tqdm "401.71it/s" false positive and the flapping reclaimer
       # alert were both logic bugs in valid expressions that nothing else caught.
+      - name: Stanford migration regression tests
+        if: ${{ !cancelled() }}
+        run: make stanford
+
       - name: Loki rule tests (real expressions against a real Loki)
         if: ${{ !cancelled() }}
         env:

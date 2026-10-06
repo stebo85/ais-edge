@@ -13,7 +13,7 @@ assigned/, and a hardlink cannot cross a filesystem boundary. Split them and
 `hardlink_or_copy` silently degrades to a full byte copy of every study.
 */ -}}
 {{- $img := printf "%s:%s" .Values.ingest.image.repository .Values.ingest.image.tag -}}
-{{- if .Values.ingest.orthancGroup.enabled }}
+{{- if and .Values.ingest.orthancGroup.enabled (not .Values.ingest.stanford.enabled) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -52,8 +52,8 @@ spec:
           imagePullPolicy: {{ .Values.ingest.image.pullPolicy }}
           command: ["xnat-ingest", "group-orthanc"]
           args:
-            - "http://{{ include "edge.fullname" . }}-orthanc.{{ .Values.namespace }}.svc.cluster.local:{{ .Values.orthanc.httpPort }}"
-            - "/data/orthanc-storage"
+            - {{ include "edge.orthancUrl" . | quote }}
+            - {{ .Values.orthanc.storageDirectory | quote }}
             - "/data/grouped"
             - "$(ORTHANC_USER)"
             - "$(ORTHANC_PASSWORD)"
@@ -63,7 +63,7 @@ spec:
                    every study and stall the pipeline with no error. Derived
                    rather than declared so an operator cannot leave it set by
                    mistake while switching engines. */}}
-            {{- with (eq (include "edge.deidEngine" $) "orthanc") | ternary .Values.ingest.orthancGroup.toProcessLabel "" }}
+            {{- with (or (eq (include "edge.deidEngine" $) "orthanc") (not $.Values.orthanc.enabled)) | ternary .Values.ingest.orthancGroup.toProcessLabel "" }}
             # Only studies carrying this label are pulled. The de-id hook
             # applies it in OnStableStudy, AFTER the original has been backed
             # up and the instance de-identified — which is what makes the
@@ -183,7 +183,7 @@ spec:
         {{- include "edge.pipelineVolume" . | nindent 8 }}
 ---
 {{- end }}
-{{- if or .Values.ingest.orthancGroup.enabled .Values.ingest.fileDrop.enabled }}
+{{- if and (or .Values.ingest.orthancGroup.enabled .Values.ingest.fileDrop.enabled) (not .Values.ingest.stanford.enabled) }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:

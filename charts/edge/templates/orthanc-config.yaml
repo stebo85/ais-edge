@@ -1,3 +1,4 @@
+{{- if .Values.orthanc.enabled }}
 {{- /*
 Orthanc configuration, split across TWO ConfigMaps mounted at TWO paths.
 
@@ -151,4 +152,6 @@ data:
     }
   deidentification-profile.json: |
     {{- toJson .Values.orthanc.deid.profile | nindent 4 }}
+{{- end }}
+
 {{- end }}

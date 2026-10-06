@@ -1,1223 +1,1033 @@
-# k0s + k0smotron + SeaweedFS — Edge Medical Imaging Ingest
+# AIS Edge — medical imaging ingest from hospital to XNAT
 
-A centrally-managed edge computing system for medical imaging data capture and upload to XNAT.
-Part of [NIF FDRI Stream 2](https://github.com/Australian-Imaging-Service).
+Receives DICOM inside a hospital, de-identifies it at the point of capture, and
+delivers it to XNAT — without the hospital network ever needing an inbound
+route, and without XNAT credentials ever leaving the management node.
 
-## Prerequisites
+---
 
-- **Management node**: Ubuntu 22.04+, 8GB+ RAM, 100GB+ disk
-- **Edge worker(s)**: Ubuntu 22.04+, 4GB+ RAM, 50GB+ disk
-- **SSH access**: Key-based SSH from management node to each edge worker
-- **XNAT instance**: Accessible via HTTPS with a local service account
-- **DICOM source**: One or more modalities that can C-STORE already-deidentified DICOMs to the edge node on port 4242 (AET=`AISEDGE`).
-- **Outbound internet**: Both management and edge nodes need it (for pulling container images)
+> **New here?** Read [docs/TOUR.md](docs/TOUR.md) first — a guided walkthrough
+> of what you configure, what runs, what can go wrong, and where the data goes.
 
-## Quick Start
+## Contents
 
-### Files a site admin must edit before install
+- [What this is](#what-this-is)
+- [Deployment topology](#deployment-topology)
+- [Architecture](#architecture)
+- [Data flow, step by step](#data-flow-step-by-step)
+- [Install](#install)
+- [Configuration reference](#configuration-reference)
+- [Secrets](#secrets)
+- [Data policy — what is kept and for how long](#data-policy--what-is-kept-and-for-how-long)
+- [Security model](#security-model)
+- [Observability and alerting](#observability-and-alerting)
+- [Repository structure](#repository-structure)
+- [Continuous integration](#continuous-integration)
+- [Operating](#operating)
+- [Troubleshooting](#troubleshooting)
+- [Uninstall](#uninstall)
+- [Pinned versions](#pinned-versions)
 
-**Two** files — both have a `.template` next to them. Copy and fill in.
-Both are gitignored once copied, so secrets never end up in version control.
+---
 
-| File (after copy) | What to set | Source |
-|---|---|---|
-| `config/management.env` | `MGMT_NODE_IP`, XNAT URL/user/pass, S3 admin keys, observability vars | `management.env.template` |
-| `config/edge-nodes.env` | `EDGE_NODES` array — one line per edge site (IP, SSH user/key, XNAT project, scoped S3 key/secret) | `edge-nodes.env.template` |
+## What this is
 
-Anything else under `config/` (`k0s-controller.yaml`, the Lua hook, `orthanc.json`) ships with sane defaults and rarely needs editing. Inside each template, look for `# REQUIRED` markers to identify the fields you must fill in.
+A **management node** runs the central services: S3 staging, the XNAT uploader,
+the observability stack, the internal certificate authority, and one k0smotron
+*hosted control plane* per edge site.
 
-### Steps
+An **edge** is a single machine inside a hospital network running Orthanc and
+the ingest pipeline. It has no inbound route from the internet. It reaches the
+management node outbound over TLS, and its Kubernetes control plane physically
+runs on the management node — so the hospital operates a Kubernetes node without
+operating a Kubernetes cluster.
 
-```bash
-# 1. Clone this repo on the management node
-git clone <repo-url> && cd k0s-k0smotron-mvp
-
-# 2. Copy templates + edit the two files above
-cp config/management.env.template                          config/management.env
-cp config/edge-nodes.env.template                          config/edge-nodes.env
-$EDITOR config/management.env \
-        config/edge-nodes.env
-
-# 3. Ensure SSH access to edge nodes
-ssh-keygen -t ed25519       # if you don't have a key
-ssh-copy-id ubuntu@<edge-ip>
-
-# 4. Install
-chmod +x install.sh scripts/*.sh
-./install.sh
-```
-
-Architecture, data flow, security model, and component-by-component reference are all below.
+The de-identification happens **on the edge, before anything leaves the site**.
+The original is written to a facility backup that is never automatically
+deleted; everything downstream is derived data.
 
 ---
 
 ## Deployment topology
 
-AIS-Edge supports two deployment shapes, selected by `INSTALL_TOPOLOGY` in
-`config/management.env`. Both run the same application stack — the
-difference is purely how the management cluster exposes itself to edges
-and how edge workers resolve management-side hostnames.
+### Tier 2 — fleet (this repo's primary mode)
 
-| | `INSTALL_TOPOLOGY=onprem` (default) | `INSTALL_TOPOLOGY=cloud` |
-|---|---|---|
-| Inbound TLS | `nginx-ingress` binds `:443` via `hostNetwork: true` on the mgmt node | `nginx-ingress` exposed as `Service type: LoadBalancer`; cloud LB owns the public IP |
-| Hostname resolution | `/etc/hosts` writes on each edge VM + `hostAliases:` inside each pod | Real public DNS (a registered zone or `nip.io` for dev) |
-| Where it runs | k0s on a single mgmt VM you fully control | Managed K8s (EKS, GKE, AKS, OpenStack Magnum, Nectar k0s + Octavia) |
-| Cert issuer (default) | `ais-edge-ca-issuer` (self-signed root, distributed to edges) | Same `ais-edge-ca-issuer` for dev; `letsencrypt-prod` for production |
+Many hospitals, one management node, one XNAT credential for the whole fleet.
 
-### Per-cloud install guides
-
-Cloud-topology details differ per provider (LB controller, credential
-format, FIP semantics, DNS-01 solver). Each provider has its own page
-under [`docs/clouds/`](docs/clouds/README.md):
-
-| Provider | Doc | Status |
-|---|---|---|
-| **OpenStack — private subnet + FIP** (recommended for production) | [`openstack-private-subnet.md`](docs/clouds/openstack-private-subnet.md) | mirrors AWS / GCP / Azure shape |
-| **OpenStack — Nectar QLD shared external network** (dev/test only) | [`openstack-nectar.md`](docs/clouds/openstack-nectar.md) | ✅ E2E tested |
-| AWS (EKS) | [`aws.md`](docs/clouds/aws.md) | design complete |
-| GCP (GKE) | [`gcp.md`](docs/clouds/gcp.md) | design complete |
-| Azure (AKS) | [`azure.md`](docs/clouds/azure.md) | design complete |
-
-Architecture overview, packet flow, dev→prod swap procedure are in
-[`docs/cloud-deployment.md`](docs/cloud-deployment.md).
-
-### Cloud-mode config knobs
-
-All set in `config/management.env`. Defaults + per-knob docstrings live in
-[`config/management.env.template`](config/management.env.template).
-
-```bash
-export INSTALL_TOPOLOGY="cloud"
-export CLOUD_PROVIDER="openstack"             # openstack | aws | gcp | azure | none
-export CLOUD_CREDENTIALS_FILE="/path/to/openrc.sh"   # any shell script of `export X=Y` lines;
-                                              # auto-sourced by install.sh before cloud steps
-export LB_PUBLIC_IP=""                        # set if you can pre-allocate a FIP, leave blank
-                                              # to let the cloud LB controller auto-assign
-export LB_SUBNET_ID=""                        # OpenStack: subnet UUID where the LB VIP lives
-export LB_AVAILABILITY_ZONE=""                # OpenStack: Octavia AZ (must match mgmt-VM AZ)
-export PRECREATE_LB=""                        # set to "1" only on Nectar's shared-network
-                                              # topology — step 00a creates the LB up front
-                                              # and writes the VIP back into this file so the
-                                              # rest of the install runs uninterrupted
-export OCCM_CLUSTER_NAME="aisedge"            # unique per project to avoid stale-LB name
-                                              # collisions in OCCM's name-based lookup
-export INTERNAL_DOMAIN="aisedge.example.com"  # your DNS zone, or .<LB-IP-dashed>.nip.io for dev
-export CERT_ISSUER="ais-edge-ca-issuer"       # or "letsencrypt-prod" once on a real domain
-export DNS_PROVIDER=""                        # only when CERT_ISSUER=letsencrypt-*
-                                              # (cloudflare | route53 | clouddns | azuredns | rfc2136)
+```
+   Hospital A                Hospital B                Hospital C
+   ┌──────────┐              ┌──────────┐              ┌──────────┐
+   │ edge-a   │              │ edge-b   │              │ edge-c   │
+   │ Orthanc  │              │ Orthanc  │              │ Orthanc  │
+   └────┬─────┘              └────┬─────┘              └────┬─────┘
+        │  outbound HTTPS only    │                         │
+        └────────────┬────────────┴─────────────────────────┘
+                     ▼
+        ┌────────────────────────────────────┐
+        │      MANAGEMENT NODE               │
+        │  SeaweedFS   s3://ingest-<edge>/   │
+        │  uploader    per edge → XNAT       │
+        │  reclaimer   per edge              │
+        │  k0smotron   a control plane each  │
+        │  Prometheus · Loki · Grafana       │
+        │  cert-manager (internal CA)        │
+        └───────────────┬────────────────────┘
+                        ▼
+                      XNAT
 ```
 
-### Cloud-only install step
+Each edge gets its **own S3 bucket, own identity, own uploader, own reclaimer,
+own control plane**. One site's stuck session, expired credential or poison
+study cannot stop delivery for any other site.
 
-A single extra step runs ahead of `01b` when `INSTALL_TOPOLOGY=cloud` +
-`CLOUD_PROVIDER=openstack` + `PRECREATE_LB=1`:
+### Tier 1 — single site
 
-- **`00a-precreate-lb`** — pre-creates the Octavia LB on the tenant
-  subnet, captures its auto-assigned VIP, and writes
-  `LB_PUBLIC_IP` + `INTERNAL_DOMAIN` back into `management.env` before
-  any cert is minted. Skips silently for managed K8s (EKS / GKE / AKS /
-  Magnum) where the platform CCM handles this synchronously with the
-  Service creation in step 02c.
+One machine, no management node. Install `charts/edge` alone with
+`upload.mode: direct`, and the edge talks to XNAT itself. This repo's management
+chart is not needed.
 
-Everything else (`01`, `01b`, `02`…`07c`) is identical to the onprem
-path — just with different rendering of templates (no `hostAliases:`
-blocks on edge pods, no `/etc/hosts` writes on mgmt VM or edge VMs, no
-IP SANs in server certs).
+---
 
 ## Architecture
 
-### Two-edge model
-
-AIS-Edge has two "edge" components, both running the same ingest stack but at different points in the pipeline:
-
-- **Facility edge** — sits on the facility's network alongside the modalities. Receives DICOMs locally (C-STORE on port 4242 or file drop), stages, and pushes over the internet to the server side.
-- **Server edge** — sits on or alongside the AIS-Server / XNAT cluster. Receives staged data from the facility edge and uploads it into XNAT via REST.
-
-Internet transfer happens **only between the two edges** — never directly from a facility to XNAT.
-
-### Why this split
-
-| Reason | Effect |
-|---|---|
-| **Centralised k8s management** | The Kubernetes management cluster runs on the server side and manages both the server-edge and facility-edge worker nodes via k0smotron + konnectivity. AIS operators `kubectl` from the server side to manage the facility edge — no per-site kubeconfig juggling |
-| **Outbound-only from the facility** | The facility edge only opens outbound TCP/443 to the server side. No inbound ports needed from the internet or management network. Works behind aggressive hospital firewalls |
-| **XNAT credentials stay server-side** | The XNAT REST credentials live only on the server edge. A compromised facility edge cannot reach XNAT directly |
-| **Low resource floor at facility** | Facility edge runs a k0s *worker* only (the control plane is hosted on the server side via k0smotron). 4GB RAM is enough |
-
-### Network shape
-
-Edge nodes connect to the management cluster over a single TLS port (443).
-nginx-ingress on the management host reads the SNI from the TLS handshake and
-routes to the right backend. The only inbound port at the edge is DICOM
-port 4242 on the local facility LAN (for modality C-STOREs); there are no
-inbound ports from the internet or management network.
-
-```
-              Management Node                              Edge Worker(s)
-       ┌──────────────────────────────────┐         ┌──────────────────────────┐
-       │  nginx-ingress (hostNet :443)    │         │  k0s worker              │
-       │  ├─ TLS terminate / SNI-route    │         │                          │
-       │  │   - seaweedfs.aisedge.local   │◄────────┤  Outbound :443 to mgmt   │
-       │  │   - k0s.aisedge.local         │  TLS    │                          │
-       │  │   - konnect.aisedge.local     │  :443   │  Orthanc pod             │
-       │  │  (all certs signed by         │         │   ├─ DICOM SCP :4242 on  │
-       │  │   ais-edge-ca via cert-mgr)   │         │   │  local facility LAN  │
-       │  │                               │         │   ├─ Lua hook: labels   │
-       │  k0smotron operator              │         │   │  stable studies     │
-       │  ├─ hosted control plane (CIP)   │         │   └─ Storage on hostPath│
-       │  │   ↳ Ingress for API+konect    │         │      /data/orthanc-     │
-       │  │                               │         │       storage/          │
-       │  SeaweedFS (ClusterIP only)      │         │                          │
-       │  ├─ S3 :8333 (HTTP, in-cluster)  │         │  xnat-ingest-sort pod    │
-       │  │  edges hit via Ingress :443   │         │   ├─ REST-polls Orthanc │
-       │  │                               │         │   └─ hardlinks stored   │
-       │  xnat-ingest-upload pod          │         │      instances into     │
-       │  └─ in-cluster DNS to seaweedfs  │         │      /data/staging/     │
-       │                                  │         │                          │
-       │  cert-manager: ais-edge-ca       │         │  s3-uploader pod         │
-       │  ├─ self-signed root (10 yr)     │         │   ├─ mc trusts ais-edge-│
-       │  └─ issues server certs (1 yr)   │         │   │  ca via ca-bundle   │
-       │                                  │         │   └─ mc mirror →        │
-       │                                  │         │      https://seaweedfs..│
-       │                                  │         │                          │
-       │                                  │         │  Credentials on edge:   │
-       │                                  │         │   ├─ S3 write-only key  │
-       │                                  │         │   └─ ais-edge-ca.crt    │
-       │                                  │         │                          │
-       │                                  │         │  Mgmt-net inbound: ZERO │
-       └─────────┬────────────────────────┘         │  LAN inbound: :4242 only │
-                 │ HTTPS REST API                   └──────────────────────────┘
-                 ▼
-       ┌──────────────────────────┐                  ◄────────  Modalities
-       │  XNAT Server             │                          C-STORE to AET=
-       │ (separate infrastructure)│                          AISEDGE :4242
-       └──────────────────────────┘
-```
-
-## Data Flow
-
-```
-1. Modality C-STOREs to Orthanc on edge worker
-   - Orthanc receives on port 4242 with AET=AISEDGE
-   - DICOMs are expected to already be deidentified by the facility scanner
-         │
-         ▼
-2. Orthanc Lua hook (on edge, deidentify-and-forward.lua)
-   - Does not modify, delete, back up, or re-store DICOM instances
-   - OnStableStudy (after StableAge=30s silence):
-     a. PUTs label "xnat-ingest-ready" on the study
-         │
-         ▼
-3. xnat-ingest sort (on edge, REST-pull mode)
-   - Polls Orthanc REST every INGEST_LOOP_SECONDS
-   - Filters: has label "xnat-ingest-ready", lacks label "xnat-ingest-skip"
-   - Hardlinks instances from /data/orthanc-storage/ into
-     /data/staging/PROJECT.SUBJECT.VISIT/<scan>/DICOM/
-     (same filesystem — hardlink, not copy)
-   - PUTs label "xnat-ingest-skip" on the study
-         │
-         ▼
-4. s3-uploader (on edge, using `mc mirror`)
-   - Reads staged sessions from /data/staging/
-   - Mirrors to SeaweedFS at s3://ingest-bucket/staged/ (write-only key)
-   - Deletes local /data/staging/ copy only after successful upload
-   - SeaweedFS (via S3 API) handles multipart upload, checksums, resume on failure
-         │
-         ▼
-5. SeaweedFS (on management node)
-   - Stores files under s3://ingest-bucket/staged/<session>/
-   - Write-only from edge, full access from management
-         │
-         ▼
-6. xnat-ingest upload (on management node)
-   - Reads from s3://ingest-bucket/staged
-   - Uploads to XNAT via REST API (XNAT credentials only here)
-   - Creates project/subject/session/scan hierarchy in XNAT
-   - Verifies checksums after upload
-   - Skips sessions already in XNAT (idempotent)
-```
-
-AIS Edge trusts the facility scanner's deidentification. Everything
-downstream of Orthanc works with the identifiers already present in the
-incoming DICOM.
-
-## How the S3 Uploader Works
-
-The `s3-uploader` pod runs on the edge worker using the `minio/mc` (MinIO Client) image.
-It's a simple shell loop — no custom code:
-
-```bash
-# Configure mc with the write-only credentials.
-# mc reads PEM files in /root/.mc/certs/CAs/ — we mount the ca-bundle Secret
-# there, so mc trusts our ais-edge-ca-signed seaweedfs-tls cert.
-mc alias set edge "https://seaweedfs.aisedge.local" "<access-key>" "<secret-key>"
-
-# Loop forever, checking every 30 seconds
-while true; do
-    for session_dir in /data/staging/*/; do
-        # Upload entire session directory to SeaweedFS, preserving structure
-        mc mirror --overwrite "$session_dir" "edge/ingest-bucket/staged/$session_name/"
-
-        # Delete local copy only after successful upload
-        rm -rf "$session_dir"
-    done
-    sleep 30
-done
-```
-
-`mc mirror` is like `rsync` for S3. Under the hood it:
-- Breaks large files into **multipart chunks** (handles 100GB+ files)
-- Uploads chunks in **parallel** for speed
-- Verifies **MD5 checksums** after each chunk
-- **Retries failed chunks** automatically
-- Only transfers **new/changed files** if re-run (delta sync)
-
-The actual protocol is standard HTTP PUT to the S3 API — the same protocol AWS S3 uses.
-If SeaweedFS is swapped for AWS S3, the uploader works without changes (just a different endpoint URL).
-
-## Security Model
-
-```
-Edge Worker                                   Management Node             XNAT
-├─ S3 write-only key                          ├─ S3 admin key             ├─ User data
-│  (write+list on one bucket only)            ├─ XNAT admin credentials   │
-│  (cannot read other sites' data)            ├─ ais-edge-ca PRIVATE key  │
-├─ NO XNAT credentials                        │  (in cert-manager Secret) │
-├─ NO inbound ports                           │                           │
-├─ ais-edge-ca PUBLIC cert (mounted)          │                           │
-│  used to verify mgmt server identity        │                           │
-├─ Outbound only, single port:                │                           │
-│  → mgmt :443 (TLS, SNI-routed)              │                           │
-```
-
-| If compromised... | Impact |
-|--------------------|--------|
-| Edge worker | Attacker sees local DICOMs + scoped S3 key + public CA cert. Key can only write to ingest bucket. Cannot read other sites' data. Cannot access XNAT. Cannot forge new server certs (CA private key is on management). |
-| Edge S3 key | Can write junk to one bucket. Cannot read data. Cannot access XNAT. Cannot impersonate other sites. |
-| Wire (between edge and management) | Sniffer sees TLS-encrypted bytes only. Cannot read DICOMs in transit. Cannot impersonate the management server (would need a cert signed by ais-edge-ca). |
-| Management node | Full access — this is your crown jewel. Harden accordingly. CA private key lives here; back it up offline if you can't tolerate re-rolling all edge trust on rebuild. |
-
-## Repository Structure
-
-```
-k0s-k0smotron-mvp/
-├── README.md                              ← You are here
-├── install.sh                             ← Main installer (run this)
-├── ais-edge-ca.crt                        ← Public CA cert (gitignored; generated at install)
-├── config/
-│   ├── management.env.template            ← Management node config (copy to management.env)
-│   ├── edge-nodes.env.template            ← Edge nodes config (copy to edge-nodes.env)
-│   ├── k0s-controller.yaml               ← k0s cluster config
-│   └── orthanc/                           ← Edge-side Orthanc config (mounted as ConfigMaps)
-│       ├── orthanc.json                   ← Daemon config (AET, ports, storage paths)
-│       └── deidentify-and-forward.lua     ← Label-only Lua hook
-├── manifests/
-│   ├── 01-management/                     ← Runs on management cluster
-│   │   ├── cert-issuers.yaml              ← cert-manager bootstrap + CA + CA Issuer
-│   │   ├── nginx-ingress-values.yaml.tpl  ← helm values for nginx-ingress
-│   │   ├── seaweedfs.yaml.tpl             ← SeaweedFS Deployment + ClusterIP Service
-│   │   ├── seaweedfs-tls-cert.yaml.tpl    ← server cert for SeaweedFS Ingress
-│   │   ├── seaweedfs-ingress.yaml.tpl     ← nginx Ingress at :443 with SNI route
-│   │   ├── edge-cluster.yaml.tpl          ← Hosted k0s control plane (with spec.ingress)
-│   │   └── xnat-upload.yaml.tpl           ← Reads SeaweedFS → uploads to XNAT
-│   └── 02-edge/                           ← Runs on edge workers (child cluster)
-│       ├── xnat-ingest.yaml.tpl           ← Sort (Orthanc REST-pull mode) + s3-uploader
-│       └── orthanc.yaml.tpl               ← Orthanc Deployment + Service + Secret
-├── scripts/
-│   ├── 00-common.sh                       ← Shared functions
-│   ├── 01-install-k0s.sh                  ← Install k0s on mgmt
-│   ├── 02-install-k0smotron.sh            ← cert-manager + k0smotron
-│   ├── 02b-bootstrap-ca.sh                ← Bootstrap self-signed CA (ais-edge-ca)
-│   ├── 02c-install-nginx-ingress.sh       ← nginx-ingress on hostNetwork :443
-│   ├── 02d-install-observability.sh       ← Loki + Prom + Grafana + Vector (optional)
-│   ├── 03-deploy-seaweedfs.sh             ← SeaweedFS + TLS cert + Ingress
-│   ├── 04-deploy-xnat-upload.sh           ← Mgmt-side XNAT upload pod
-│   ├── 05-setup-edge-cluster.sh           ← Per-edge: hosted control plane + token
-│   ├── 06-join-edge-worker.sh             ← Per-edge: install k0s worker, /etc/hosts, CoreDNS
-│   ├── 07-deploy-edge-ingest.sh           ← Per-edge: deploy sort (REST-pull) + s3-uploader
-│   ├── 07b-deploy-edge-observability.sh   ← Per-edge: Vector log shipper (optional)
-│   ├── 07c-deploy-edge-orthanc.sh         ← Per-edge: deploy Orthanc + label Lua hook
-│   ├── rotate-ca.sh                       ← CA rotation (--phase=1 / --phase=2)
-│   └── uninstall.sh                       ← Tears down everything
-└── .gitignore
-```
-
-`.tpl` files are manifest templates — placeholders like `{{CLUSTER_NAME}}` are replaced with
-values from your config files during installation.
-
-## Installing on an Existing Kubernetes Cluster
-
-If you already have a Kubernetes cluster running (k3s, kubeadm, MicroK8s, etc.):
-
-1. Set `INSTALL_MODE="existing"` in `config/management.env`
-2. Ensure `kubectl` is configured and pointing to your cluster (`~/.kube/config`)
-3. Ensure a default StorageClass exists (check with `kubectl get sc`)
-4. Run `./install.sh` — it will skip k0s installation and use your existing cluster
-
-The installer will deploy k0smotron, SeaweedFS, and the upload pod as regular workloads
-on your existing cluster. Everything else works the same.
-
-## Adding More Edge Nodes
-
-Edit `config/edge-nodes.env` and add entries to the `EDGE_NODES` array:
-
-```bash
-EDGE_NODES=(
-  "edge-uqcai|203.101.230.171|ubuntu|~/.ssh/id_ed25519|uqcai-project|edge-uqcai-key|uqcai-secret"
-  "edge-usyd|10.0.1.50|ubuntu|~/.ssh/id_ed25519|usyd-project|edge-usyd-key|usyd-secret"
-  "edge-newcastle|10.0.2.50|ubuntu|~/.ssh/id_ed25519|newcastle-project|edge-newcastle-key|newcastle-secret"
-)
-```
-
-Each edge node gets:
-- Its own hosted k0s control plane (separate namespace on management cluster)
-- Its own scoped S3 credentials (write+list to ingest bucket only — isolated per site)
-- Its own kubeconfig file (`kubeconfig-edge-uqcai`, etc.)
-- Its own xnat-ingest pods
-
-Then re-run `./install.sh` — it will skip already-installed components and only set up new nodes.
-
-## Removing a Single Edge Node
-
-To remove one edge site without affecting others:
-
-```bash
-# 1. Delete workloads on the edge cluster
-kubectl --kubeconfig kubeconfig-edge-uqcai delete namespace xnat-ingest
-
-# 2. Reset the edge worker VM
-ssh ubuntu@<edge-ip> "sudo k0s stop && sudo k0s reset"
-
-# 3. Delete the hosted cluster from management
-kubectl delete namespace edge-uqcai
-
-# 4. Remove the S3 identity (regenerate s3.json without this edge user)
-#    Just remove the entry from edge-nodes.env, then re-run scripts/03-deploy-seaweedfs.sh
-#    (it regenerates the SeaweedFS s3.json ConfigMap and rolls the pod)
-
-# 5. Clean up generated files
-rm kubeconfig-edge-uqcai join-token-edge-uqcai
-
-# 6. Remove the entry from config/edge-nodes.env
-```
-
-## Tested Versions
-
-| Component | Version | Notes |
-|-----------|---------|-------|
-| Ubuntu | 22.04.5 LTS | Management and edge nodes |
-| k0s | v1.35.2+k0s.0 | Both management cluster and edge workers |
-| k0smotron | v1.10.4 (stable) | Installed via `kubectl apply` (not Helm). Uses built-in `spec.ingress` for SNI routing. |
-| cert-manager | latest | Issues `ais-edge-ca` (10y root) + per-service server certs (1y, auto-renew) |
-| nginx-ingress | latest (helm) | hostNetwork :443. SSL passthrough enabled (k0s API + konnectivity); TLS termination for SeaweedFS. |
-| SeaweedFS | 3.99 | `chrislusf/seaweedfs:3.99` (last 3.x stable, avoids 4.18/4.19 filer memory regression — issue #9035). ClusterIP only; external access via Ingress. |
-| MinIO Client (mc) | latest | `minio/mc:latest` — vendor-neutral S3 client used by edge s3-uploader. Trusts `ais-edge-ca` via mounted ca-bundle Secret. |
-| Orthanc | 1.12.6 (plugins) | `jodogne/orthanc-plugins:1.12.6` — DICOM SCP on edge port 4242. Needs ≥ 1.12.0 for study-level labels. |
-| xnat-ingest | v0.1.0 | `ghcr.io/aswinnarayanan/xnat-ingest:v0.1.0` — logging-v3 + Orthanc REST-pull mode. |
-| local-path-provisioner | v0.0.30 | Default StorageClass for etcd PVCs |
-
-To pin specific versions in production, replace `:latest` / `:3.99` tags in the `.tpl`
-manifests with explicit versions (e.g. `chrislusf/seaweedfs:3.99-rc1`).
-
-## How the Template System Works
-
-Manifest files ending in `.tpl` contain placeholders like `{{S3_BUCKET}}`.
-The `render()` function in `scripts/00-common.sh` performs simple string replacement
-at install time — no Helm, no Jinja, no external tools required.
-
-```bash
-# Example: what happens when install.sh processes seaweedfs-ingress.yaml.tpl
-Input:   host: {{SEAWEEDFS_HOSTNAME}}
-Output:  host: seaweedfs.aisedge.local
-```
-
-Values come from `config/management.env` and `config/edge-nodes.env`. You never edit `.tpl` files.
-
-## S3 Path Structure in SeaweedFS
-
-```
-s3://ingest-bucket/
-└── staged/
-    ├── test-project.patient01.visit01/           ← one directory per session
-    │   └── 1.T1w_MPRAGE/                        ← scan ID + description
-    │       └── DICOM/                            ← resource type
-    │           ├── file1.dcm
-    │           ├── file2.dcm
-    │           └── MANIFEST.json
-    ├── test-project.patient02.visit01/
-    │   └── ...
-    └── ...
-```
-
-The `staged/` prefix separates ingest data from any other bucket contents.
-Session directory names follow the format `PROJECT.SUBJECT.VISIT`.
-
-## Edge Data Directory Structure
-
-On each edge worker:
-
-```
-/data/xnat-ingest/
-├── orthanc-storage/     ← Orthanc DICOM storage tree
-└── staging/
-    └── PROJECT.SUBJECT.VISIT/  ← xnat-ingest sort's hardlinked output, awaiting S3 upload
-```
-
-Files flow: Modality C-STORE → Orthanc stores the received DICOM → Lua labels stable study → sort hardlinks → `staging/` → SeaweedFS → eventually deleted from edge after successful S3 upload.
-
-`/data/orthanc-storage` and `/data/xnat-ingest/staging` **must be on the same physical filesystem** so hardlinks resolve (cross-fs hardlinks fail with EXDEV).
-
-## Health Checks
-
-```bash
-# Management cluster health
-kubectl get pods -A                              # all pods should be Running
-kubectl get nodes                                # management node should be Ready
-
-# Edge cluster health
-kubectl --kubeconfig kubeconfig-<name> get nodes  # edge worker should be Ready
-kubectl --kubeconfig kubeconfig-<name> get pods -n xnat-ingest  # sort + s3-uploader Running
-
-# SeaweedFS health (TLS via nginx-ingress; CA bundle is ais-edge-ca.crt)
-curl --cacert ais-edge-ca.crt \
-     --resolve seaweedfs.aisedge.local:443:<MGMT_IP> \
-     https://seaweedfs.aisedge.local/   # → 403 (S3 unauth) means path works
-
-# SeaweedFS master + filer (admin only — port-forward, no external port)
-kubectl port-forward -n seaweedfs svc/seaweedfs 9333:9333 &  # master  http://localhost:9333
-kubectl port-forward -n seaweedfs svc/seaweedfs 8888:8888 &  # filer   http://localhost:8888
-
-# SeaweedFS from edge (with CA verification)
-ssh ubuntu@<EDGE_IP> "curl --cacert /tmp/ais-edge-ca.crt https://seaweedfs.aisedge.local/"
-
-# SeaweedFS bucket contents (mgmt-side via port-forward + mc alias)
-kubectl port-forward -n seaweedfs svc/seaweedfs 8333:8333 &
-mc alias set seaweed-admin http://localhost:8333 <admin-key> <admin-secret>
-mc ls seaweed-admin/ingest-bucket/staged/        # list sessions in bucket
-
-# XNAT connectivity
-curl -sk <XNAT_URL>                              # should return HTML
-
-# Check logs for errors
-kubectl logs -n xnat-upload -l component=upload --tail=5           # XNAT upload
-kubectl --kubeconfig kubeconfig-<name> logs -n xnat-ingest -l component=sort --tail=5
-kubectl --kubeconfig kubeconfig-<name> logs -n xnat-ingest -l component=s3-uploader --tail=5
-```
-
-## SeaweedFS Master & Filer UIs
-
-The SeaweedFS Service is **ClusterIP only** — no external port. Reach
-the admin UIs via `kubectl port-forward` from the management node:
-
-```bash
-# Master UI — cluster topology, volume servers, free capacity, leader election
-kubectl port-forward -n seaweedfs svc/seaweedfs 9333:9333 &
-xdg-open http://localhost:9333
-
-# Filer UI — browse the filesystem layer (objects under /buckets/<bucket>/...)
-kubectl port-forward -n seaweedfs svc/seaweedfs 8888:8888 &
-xdg-open http://localhost:8888
-```
-
-For an S3-style admin experience, port-forward 8333 and use `mc`:
-
-```bash
-kubectl port-forward -n seaweedfs svc/seaweedfs 8333:8333 &
-mc alias set seaweed-admin http://localhost:8333 <admin-key> <admin-secret>
-mc ls seaweed-admin/                                    # list buckets
-mc ls --recursive seaweed-admin/ingest-bucket/staged/   # list sessions
-mc admin info seaweed-admin                             # cluster info
-```
-
-## Updating Components
-
-**Update xnat-ingest image:**
-```bash
-# Edge cluster — restart pods to pull latest image
-kubectl --kubeconfig kubeconfig-<name> rollout restart deployment/xnat-ingest-sort -n xnat-ingest
-kubectl --kubeconfig kubeconfig-<name> rollout restart deployment/s3-uploader -n xnat-ingest
-
-# Management cluster — restart XNAT upload pod
-kubectl rollout restart deployment/xnat-ingest-upload -n xnat-upload
-```
-
-**Update SeaweedFS:**
-```bash
-kubectl rollout restart deployment/seaweedfs -n seaweedfs
-```
-
-**Update k0s on edge workers:**
-k0s supports in-place upgrades via Autopilot. For manual upgrade:
-```bash
-ssh ubuntu@<EDGE_IP>
-sudo k0s stop
-curl -sSLf https://get.k0s.sh | sudo sh    # installs latest
-sudo k0s start
-```
-
-**Update k0smotron:**
-```bash
-kubectl apply --server-side=true -f https://docs.k0smotron.io/stable/install.yaml
-```
-
-## Backup and Restore
-
-**What to back up:**
-- `config/management.env` and `config/edge-nodes.env` — your configuration
-- SeaweedFS data (`/data/seaweedfs/` on management node) — staged files in transit
-- XNAT — your actual data destination (backed up separately)
-
-**What does NOT need backup:**
-- Edge worker data (`/data/xnat-ingest/`) — transient staging area
-- k0s/k0smotron state — can be rebuilt from this repo
-- Generated files (`kubeconfig-*`, `join-token-*`) — regenerated on install
-
-**Restoring from scratch:**
-1. Provision fresh VMs
-2. Clone this repo, copy your saved config files
-3. Run `./install.sh`
-
-## Known Limitations
-
-- **Self-signed CA (no public trust chain)** — `ais-edge-ca` is local to this deployment.
-  Anything that doesn't load the CA bundle (browsers, third-party tools) will see
-  certificate-untrusted warnings. For a publicly-trusted chain, plug in a real CA (e.g.
-  Let's Encrypt via cert-manager's HTTP-01 / DNS-01 ACME issuer).
-- **mTLS not implemented** — edges authenticate to SeaweedFS via S3 access keys, not
-  client certificates. The wire is encrypted; identity is via key. Add a mutual-TLS
-  layer for stronger edge identity.
-- **No monitoring/alerting** — SeaweedFS disk usage, pod health, and upload failures
-  are not automatically monitored. Add Prometheus + Grafana for production
-  (SeaweedFS exposes Prometheus metrics on the master and filer).
-- **Single management node** — no HA for k0smotron, nginx-ingress, or SeaweedFS.
-  For production, split SeaweedFS into separate master/volume/filer/s3 deployments
-  with 3 masters, run multiple ingress replicas (drop hostNetwork, use a real load
-  balancer or VRRP), and run a multi-replica k0smotron control plane per cluster;
-  see "Scaling SeaweedFS" below.
-- **DICOM files with missing AccessionNumber** go to `__invalid__/` — requires manual
-  rename. This is an xnat-ingest limitation, not a system issue. Real clinical DICOMs
-  will have this field populated.
-- **emptyDir persistence for hosted control planes** — etcd data is lost if the
-  management node restarts. For production, use a proper StorageClass with persistent volumes.
-- **No automatic cleanup of SeaweedFS** — successfully uploaded sessions remain in
-  SeaweedFS until manually deleted. Add an S3 lifecycle rule or a cleanup job for
-  production.
-- **First-time install needs internet on the edge VM.** The edge worker pulls the
-  k0s binary from `get.k0s.sh` and container images from `quay.io`, `docker.io`, and
-  `ghcr.io` (k0s, konnectivity-agent, haproxy, xnat-ingest, minio/mc). Once installed,
-  the edge needs only the single 443 connection back to management — no further
-  registry access. For air-gapped sites, pre-stage the k0s binary at
-  `/usr/local/bin/k0s` and drop a `k0s airgap`-style image bundle into
-  `/var/lib/k0s/images/` on the edge VM before running the installer (k0s auto-imports
-  on start). A "build airgap bundle" helper script is not yet included.
-- **Konnectivity is HTTP/2 + gRPC over TLS.** Stateful firewalls or IDS appliances
-  that aggressively normalise TLS or block long-lived HTTP/2 streams can disrupt the
-  reverse tunnel — see the "Konnectivity and middleboxes" section below before
-  enabling the deployment behind a deep-inspection proxy.
-
-## Scaling SeaweedFS
-
-The single-pod all-in-one deployment is for the MVP. For production scale-out, split
-the SeaweedFS components into separate Deployments/StatefulSets:
-
-| Component | What it does | HA recommendation |
+| Component | Where | Role |
 |---|---|---|
-| Master | Cluster metadata, leader election | 3 replicas (Raft consensus) |
-| Volume server | Stores chunked data | N replicas across nodes; each backed by its own disk |
-| Filer | Filesystem layer (required for S3) | 2+ replicas; backed by an external metadata store (Redis/ScyllaDB/Postgres) |
-| S3 gateway | S3 API endpoint | 2+ replicas behind a Service / load balancer |
+| **Orthanc** | edge | DICOM C-STORE receiver on :4242. Runs the de-identification Lua hook on every stored instance. |
+| **deidentify-and-forward.lua** | edge | Writes the untouched original to the facility backup, then rewrites identity tags per the site's profile, then labels the study for pickup. |
+| **group-orthanc** | edge | Pulls studies labelled `xnat-ingest-ready` out of Orthanc into `/data/grouped`, then labels them `xnat-ingest-processed` so they are not pulled twice. |
+| **assign** | edge | Groups instances into XNAT sessions under `/data/assigned`, writing `__MANIFEST__.json` (per-resource, with MD5 checksums) and `__METADATA__.json`. |
+| **s3-uploader** | edge | `aws s3 sync` each settled session to `s3://ingest-<edge>/staged/`. Emits a JSON event schema that the alert rules consume. |
+| **Vector** | edge | Ships pod logs to Loki on the management node over TLS. |
+| **SeaweedFS** | mgmt | S3 staging. One bucket per edge, one scoped identity per edge. |
+| **mgmt-upload-\<edge\>** | mgmt | `xnat-ingest upload` — pulls staged sessions and writes them into XNAT. |
+| **mgmt-reclaim-\<edge\>** | mgmt | Removes staged sessions **only after XNAT confirms it holds every file**. The only component that deletes patient data. |
+| **staged-reclaimer** | edge | The same script as `mgmt-reclaim-<edge>`, run with `STORAGE=filesystem` against the terminal stage directory. Renders **only under `upload.mode: direct`**, where there is no bucket and no s3-uploader to write an `uploaded` marker, so `onUploaded` would otherwise be unsatisfiable and the tree would grow unbounded. Also deletes patient data, under the same XNAT confirmation. |
+| **cert-sync** | mgmt | Copies the CA bundle, each edge's Loki push **client certificate**, and that edge's **S3 key pair** into that edge's cluster, on a schedule, so CA rotation does not require visiting sites. |
+| **k0smotron** | mgmt | Hosts a k0s control plane per edge. The edge runs only a worker. |
+| **cert-manager** | mgmt | Issues the internal CA and every server certificate. |
 
-Edge clients (`mc mirror`) don't change — they still talk to the S3 endpoint. The
-internal architecture changes; the external API does not.
+### Why the control plane is hosted centrally
 
-## XNAT Configuration
+An edge is a box in a hospital basement that nobody logs into. Running its API
+server on the management node means:
 
-Before ingesting data, ensure:
+* the hospital does not operate etcd, certificates or control-plane upgrades;
+* the edge needs no inbound firewall rule — the worker dials out through
+  konnectivity;
+* losing the edge machine loses a worker, not a cluster.
 
-1. **XNAT project exists** — create it in the XNAT web UI before uploading.
-   The project ID must match `PROJECT_ID` in `config/edge-nodes.env`.
-2. **XNAT user is a local account** — not AAF/OIDC. Create via Administer → Users.
-3. **XNAT user has project permissions** — at least Member or Collaborator on the target project, and enough rights to manage project users if automatic owner assignment is enabled.
-4. **Project owner sync** — the management upload pod adds every username in `XNAT_PROJECT_ADMIN_USERS` to the XNAT `Owners` group for every visible project before and after each upload pass. The default is `brosnan,sciget`, so projects created by the uploader are picked up on the same loop.
+---
 
-xnat-ingest authenticates via `POST /data/JSESSION` with username/password and uses the
-session token for all subsequent REST API calls.
-
-## Accessing Clusters
-
-```bash
-# Management cluster
-kubectl get pods -A
-
-# Specific edge cluster
-kubectl --kubeconfig kubeconfig-edge-uqcai get pods -n xnat-ingest
-kubectl --kubeconfig kubeconfig-edge-usyd get nodes
-
-# Logs
-kubectl --kubeconfig kubeconfig-edge-uqcai logs -n xnat-ingest -l component=sort -f
-kubectl --kubeconfig kubeconfig-edge-uqcai logs -n xnat-ingest -l component=s3-uploader -f
-kubectl logs -n xnat-upload -l component=upload -f   # management upload to XNAT
-
-# SeaweedFS admin UIs (ClusterIP only — port-forward from mgmt)
-kubectl port-forward -n seaweedfs svc/seaweedfs 9333:9333 &  # master
-kubectl port-forward -n seaweedfs svc/seaweedfs 8888:8888 &  # filer
-```
-
-## Testing
-
-```bash
-# C-STORE an already-deidentified DICOM to Orthanc at the edge.
-storescu -aec AISEDGE -aet TEST_MOD <EDGE_IP> 4242 test.dcm
-
-# Watch the Orthanc Lua label events
-kubectl --kubeconfig kubeconfig-edge-dev logs -n xnat-ingest deploy/orthanc -f \
-  | grep -E 'instance_received|study_labeled_ready|ERROR'
-
-# Watch sort pod REST-pull from Orthanc and hardlink into staging
-kubectl --kubeconfig kubeconfig-edge-dev logs -n xnat-ingest -l component=sort -f
-
-# Watch s3-uploader push to SeaweedFS
-kubectl --kubeconfig kubeconfig-edge-dev logs -n xnat-ingest -l component=s3-uploader -f
-
-# Watch upload to XNAT
-kubectl logs -n xnat-upload -l component=upload -f
-```
-
-## Failure Scenarios
-
-| Scenario | What happens | Recovery |
-|----------|-------------|---------|
-| Network drops mid-upload | SeaweedFS S3 multipart — completed chunks saved | mc retries on next loop cycle |
-| Edge VM crashes | Files safe in /data/staging/ | k0s auto-starts, pods resume |
-| SeaweedFS crashes | Edge uploads fail, files safe on edge | Pod auto-restarts, edge retries |
-| Management node crashes | Edge files accumulate locally | Management restarts, edge reconnects |
-| XNAT is down | SeaweedFS fills up | XNAT returns, upload pod clears backlog |
-| SeaweedFS disk full | Edge uploads fail, files safe on edge | Expand `/data/seaweedfs/` or clear XNAT backlog |
-
-## Architecture: Deeper Dive
-
-The overview above shows the major components and the single 443 outbound path.
-This section drills into the host-level state, every namespace, the trust
-relationships between certificates, and how in-cluster Service traffic actually
-reaches the API server. Useful when debugging or reviewing the design.
+## Data flow, step by step
 
 ```
-══════════════════════════════════════════════════════════════════════════════════════
-  EDGE VM   (203.101.230.171)        ZERO inbound • outbound only TCP :443
-══════════════════════════════════════════════════════════════════════════════════════
-
-  Host state
-    /etc/hosts            203.101.224.240  seaweedfs.aisedge.local
-                                           k0s.aisedge.local
-                                           konnect.aisedge.local      (added by 06)
-    /etc/haproxy/certs/
-        server.pem        cert+key, signed by the cluster's internal k0s CA
-                          (so workload pods trust haproxy via the projected
-                           serviceaccount ca.crt — without this every pod that
-                           hits the kubernetes Service gets "unknown authority")
-        ca.crt            the same cluster CA — haproxy uses it to verify the
-                          upstream API
-    k0sworker.service     systemd unit; kubelet talks to https://k0s.aisedge.local:443
-                          (URL rewritten inside the join-token by 05-setup-edge..)
-
-  ┌─ default ns ──────────────────────────────────────────────────────────────────┐
-  │   k0smotron-haproxy   DaemonSet, hostNetwork:true                             │
-  │     frontend  bind [::]:7443 ssl crt /etc/haproxy/certs/server.pem            │
-  │     backend   k0s.aisedge.local:443 ssl verify required sni=k0s.aisedge.local │
-  │   * EndpointSlice for the kubernetes Service points at <edge-IP>:7443         │
-  │     so any pod calling 10.96.0.1:443 → kube-proxy NAT → local haproxy → mgmt  │
-  └───────────────────────────────────────────────────────────────────────────────┘
-  ┌─ kube-system ns ──────────────────────────────────────────────────────────────┐
-  │   coredns          Corefile has  hosts { … aisedge.local … fallthrough }      │
-  │   konnectivity-agent  --proxy-server-host=konnect.aisedge.local --port=443    │
-  │   kube-proxy / kube-router / metrics-server                                   │
-  └───────────────────────────────────────────────────────────────────────────────┘
-  ┌─ xnat-ingest ns ──────────────────────────────────────────────────────────────┐
-  │   orthanc            DICOM SCP :4242 (hostPort), Lua label hook,              │
-  │                      storage at /data/orthanc-storage                         │
-  │     mounts    ConfigMaps orthanc-config/-scripts                              │
-  │   xnat-ingest-sort   loop 60s, REST-pull from orthanc.xnat-ingest.svc:8042    │
-  │                      hardlinks /data/orthanc-storage → /data/staging          │
-  │   s3-uploader        loop 30s, runs:  mc mirror /data/staging  edge/bucket    │
-  │     env       S3_ENDPOINT=https://seaweedfs.aisedge.local                     │
-  │     mount     Secret ca-bundle (= ais-edge-ca.crt) → /root/.mc/certs/CAs/     │
-  │     hostAliases   3 aisedge.local names → MGMT_NODE_IP                        │
-  │   hostPath    /data/xnat-ingest/{orthanc-storage,staging}                     │
-  │   Secret      s3-edge-credentials   (write+list scoped to ingest-bucket)      │
-  └───────────────────────────────────────────────────────────────────────────────┘
-
-                              │
-                              │   ALL outbound traffic: TCP 443 (TLS, SNI-routed)
-                              │   firewall rule: ALLOW edge → MGMT_IP dst-port 443
-                              ▼
-
-══════════════════════════════════════════════════════════════════════════════════════
-  MGMT NODE  (203.101.224.240)        k0s controller+worker (single-node)
-══════════════════════════════════════════════════════════════════════════════════════
-
-  Host state
-    /etc/hosts            same 3 aisedge.local entries (added by 05-setup-edge..)
-    *:443                 owned by ingress-nginx-controller pod (hostNetwork:true)
-
-  ┌─ ingress-nginx ns ────────────────────────────────────────────────────────────┐
-  │   ingress-nginx-controller   helm-managed; --enable-ssl-passthrough           │
-  │     proxy-body-size=50g  proxy-read-timeout=3600  proxy-send-timeout=3600     │
-  │   ┌─ SNI router  (port 443) ─────────────────────────────────────────────┐    │
-  │   │  seaweedfs.aisedge.local → svc/seaweedfs:8333    (TLS terminate)     │    │
-  │   │  k0s.aisedge.local       → kmc-edge-dev-nodeport:30443 (passthrough) │    │
-  │   │  konnect.aisedge.local   → kmc-edge-dev-nodeport:30132 (passthrough) │    │
-  │   └──────────────────────────────────────────────────────────────────────┘    │
-  └───────────────────────────────────────────────────────────────────────────────┘
-  ┌─ cert-manager ns ─────────────────────────────────────────────────────────────┐
-  │   ClusterIssuer  selfsigned-bootstrap                                         │
-  │   Certificate    ais-edge-ca       isCA, RSA 4096, 10 yr                      │
-  │   ClusterIssuer  ais-edge-ca-issuer  ─── signs server certs ───►              │
-  │     • seaweedfs-tls   1 yr, auto-renew -30d, SANs = seaweedfs..local +MGMT_IP │
-  │   Export         ais-edge-ca.crt → REPO_DIR  (distributed to edges as Secret) │
-  └───────────────────────────────────────────────────────────────────────────────┘
-  ┌─ k0smotron ns + edge-dev ns (per-edge cluster) ───────────────────────────────┐
-  │   k0smotron-controller-manager   operator                                     │
-  │   kmc-edge-dev-0          k0s API server pod                                  │
-  │     spec.k0sConfig.spec.api.sans = [k0s.aisedge.local, konnect.., MGMT_IP]    │
-  │     cert issued by k0smotron-managed cluster CA (Secret edge-dev-ca)          │
-  │   kmc-edge-dev-etcd-0     etcd                                                │
-  │   svc/kmc-edge-dev-nodeport   NodePort 30443/30132 (in-cluster bridge only)   │
-  │   Ingress kmc-edge-dev    auto-created from spec.ingress on the Cluster CR    │
-  │     ssl-passthrough on hosts k0s.aisedge.local + konnect.aisedge.local        │
-  └───────────────────────────────────────────────────────────────────────────────┘
-  ┌─ seaweedfs ns ────────────────────────────────────────────────────────────────┐
-  │   seaweedfs   Deployment, all-in-one (master+volume+filer+s3) chrislusf:3.99  │
-  │   svc/seaweedfs   ClusterIP only — no external port (admin via port-forward)  │
-  │   ConfigMap s3-config   admin + per-edge IAM identities (config-hash rolls)   │
-  │   hostPath  /data/seaweedfs   Haystack volumes + filer leveldb                │
-  └───────────────────────────────────────────────────────────────────────────────┘
-  ┌─ xnat-upload ns ──────────────────────────────────────────────────────────────┐
-  │   xnat-ingest-upload   polls s3://ingest-bucket/staged/, pushes to XNAT       │
-  │     env   S3_ENDPOINT=http://seaweedfs.seaweedfs.svc.cluster.local:8333       │
-  │              (in-cluster path — never leaves the management node)             │
-  │   Secrets   xnat-credentials, s3-credentials                                  │
-  └───────────────────────────────────────────────────────────────────────────────┘
-
-                              │   HTTPS to XNAT's public-CA-signed endpoint
-                              ▼
-
-  ┌────────────────────────────────────────────────────────────────────────────────┐
-  │  XNAT SERVER   (xnat-test.ssdsorg.cloud.edu.au — separate k3s cluster)         │
-  │  Receives sessions via REST API; out of scope for this repo                    │
-  └────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Trust chains (who signs what)
-
-```
-  ais-edge-ca (10 yr root)  ──signs──►  seaweedfs-tls   (presented by nginx)
-                                            ▲
-                                            └─ trusted by edge mc via mounted
-                                               ca-bundle Secret (= ais-edge-ca.crt)
-
-  k0smotron cluster CA      ──signs──►  k0s API server cert (kmc-edge-dev-0)
-   (Secret edge-dev-ca)                     ▲
-                                            └─ trusted by edge kubelet via the
-                                               CA embedded in the join-token
-
-  cluster CA (same as above)──signs──►  /etc/haproxy/certs/server.pem
-                                            ▲
-                                            └─ trusted by every workload pod via
-                                               its projected serviceaccount ca.crt
-```
-
-### In-cluster Service traffic on the worker
-
-```
-   pod (in child cluster)
-        │   GET kubernetes.default.svc.cluster.local
-        │   → resolves to ClusterIP 10.96.0.1:443
-        ▼
-   kube-proxy iptables NAT
-        │   destination rewritten to <edge-IP>:7443 (per EndpointSlice)
-        ▼
-   k0smotron-haproxy DS pod   (hostNetwork on the same worker)
-        │   TLS terminate using server.pem (signed by cluster CA → pod trusts it)
-        │   open NEW outbound TLS conn:
-        ▼
-   nginx-ingress on MGMT_IP:443 (SNI = k0s.aisedge.local → ssl-passthrough)
+ 1. modality ──C-STORE──▶ Orthanc :4242
+                             │
+ 2.                          ├──▶ /data/facility-backup/<study>/…    ORIGINAL
+ 3.                          │     written FIRST, before de-identification
+                             │     governed by dataPolicy.originals (forever)
+                             ▼
+ 4.              de-identify in place (Lua, OnStoredInstance)
+                             │   identity tags replaced per site profile
+                             │   UIDs retained so a study stays coherent
+                             ▼
+ 5.              label study `xnat-ingest-ready`
+                             │
+ 6.  group-orthanc ──────────┘   (waits for IsStable; skips already-processed)
         │
         ▼
-   kmc-edge-dev-nodeport:30443 → kmc-edge-dev-0 (k0s API)
+ 7.  /data/grouped/<session>/
+        │
+ 8.  assign
+        ▼
+ 9.  /data/assigned/<project>.<subject>.<visit>/
+        │   + __MANIFEST__.json  (filenames + MD5 per resource)
+        │   + __METADATA__.json
+        │
+10.  s3-uploader   waits settleMinutes, fingerprints the tree, uploads
+        │          HTTPS, per-site credential, custom CA
+        ▼
+11.  s3://ingest-<edge>/staged/<session>/
+        │
+12.  mgmt-upload-<edge>  ──▶ XNAT
+        │
+13.  mgmt-reclaim-<edge>  re-queries XNAT, compares filenames AND checksums
+                          against the manifest, and only then deletes
 ```
 
-## FAQ
+**Every hop is idempotent and fails safe.** If the S3 endpoint is unreachable,
+the uploader keeps the local copy and retries. If XNAT is down, staged data
+accumulates rather than being lost. If the reclaimer cannot prove XNAT holds a
+session, it keeps it.
 
-**Q: Can I run k0smotron on my existing k3s/kubeadm cluster?**
-Yes. Set `INSTALL_MODE="existing"` in `config/management.env`. k0smotron is just a Kubernetes
-operator — it runs on any conformant cluster with cert manager. Edge workers still use k0s.
+---
 
-**Q: Does k0s run on Windows?**
-Not natively. Options: WSL2, Hyper-V VM, or Docker Desktop.
+## Install
 
-**Q: What credentials are stored on the edge?**
-Only a scoped SeaweedFS S3 key. It can only PUT/LIST on one bucket. It cannot read other
-sites' data, access XNAT, or do anything else. XNAT credentials never leave the management node.
+```bash
+./install.sh <site>        # interactive, one prompt per step
+./install.sh -y <site>     # non-interactive
+```
 
-**Q: How does the edge communicate without inbound ports?**
-All connections are outbound from the edge to the management node on a single port:
-- TLS port 443 — multiplexed by SNI:
-  - `k0s.aisedge.local` → k0s API server (kubelet → API)
-  - `konnect.aisedge.local` → konnectivity tunnel (API → kubelet via reverse tunnel)
-  - `seaweedfs.aisedge.local` → SeaweedFS S3 (mc mirror data uploads)
-The management node sends commands back through the konnectivity tunnel (edge-initiated).
+**One file configures a deployment: `sites/<site>/values.yaml`.** `install.sh`
+reads it *and* passes it to both Helm charts, so every fact is stated once.
+There is no `--set` anywhere in the installer — a flag needed to make an install
+work is a value that belongs in the site file, and an install you cannot
+reproduce from that file alone is not reproducible.
 
-**Q: What is konnectivity?**
-A reverse tunnel built into Kubernetes. The edge opens an outbound connection to the
-management node and keeps it open. kubectl commands flow back through this same connection.
-No inbound ports needed on the edge.
+### First-time setup
 
-**Q: What happens if the SeaweedFS edge key is stolen?**
-An attacker can only write junk files to the ingest bucket. They cannot read other sites'
-data, cannot access XNAT, and cannot access patient information. The key is easily rotated.
+```bash
+# 0. On the MANAGEMENT node: the two tools the secrets step needs. Nothing else
+#    installs them, and step 2 is the first command that fails without them.
+sudo apt-get install -y age
+curl -fsSLO https://github.com/getsops/sops/releases/download/v3.13.3/sops_3.13.3_amd64.deb
+sudo apt-get install -y ./sops_3.13.3_amd64.deb
 
-**Q: How do I rotate the SeaweedFS edge credentials?**
-1. Generate new credentials in `config/edge-nodes.env` for that edge entry.
-2. Re-run `scripts/03-deploy-seaweedfs.sh` — it regenerates `s3.json` from env and
-   rolls the SeaweedFS pod via the config-hash annotation. Old credentials become invalid.
-3. Re-run `scripts/07-deploy-edge-ingest.sh <entry>` for the affected edge — the K8s
-   Secret on the edge cluster is updated and the s3-uploader pod restarts.
+# 1. Get the repo. `main` is this tier; tier-1 (a single node, no management
+#    cluster) lives on the `tier-1-solution` branch and is not interchangeable.
+git clone <repo-url> && cd ais-edge
 
-**Q: What is a "child cluster" vs "management cluster"?**
-The management cluster runs k0smotron and hosts control planes for edge sites.
-Each edge site has a "child cluster" — its own Kubernetes cluster whose control plane
-runs as pods on the management node, but whose workers are at the edge site.
-They have separate kubeconfigs, namespaces, and RBAC.
+# 2. Create your age key and register it as a SOPS recipient
+scripts/site-secrets.sh init-key
+scripts/site-secrets.sh add-recipient <your age1... public key>
 
-**Q: Can one edge site have multiple workers?**
-Yes. Give multiple machines the same join token and they all join the same child cluster.
-Pin specific pods to specific workers using `nodeSelector` in the manifest.
+# 3. Scaffold the MANAGEMENT site (copies sites/example-mgmt/)
+scripts/site-secrets.sh new my-site mgmt
+
+# 4. Add each EDGE. PREFER add-edge OVER `new <name> edge`: it does this step and
+#    the S3 wiring in one go, GENERATING the key pair rather than making you type
+#    the same one into two files.
+scripts/site-secrets.sh add-edge my-site my-edge
+
+#    `new my-edge edge` also works, and then the edge's name has to be made to
+#    agree in FIVE places by hand. Renaming an edge means editing all of them:
+#      sites/my-site/values.yaml       edges[].name
+#      sites/my-site/values.yaml       edges[].s3SecretRef
+#      sites/my-site/secrets.enc.yaml  that Secret's metadata.name
+#      sites/my-edge/values.yaml       clusterLabel
+#      the site directory name itself
+#    Getting one wrong RENDERS CLEANLY: the management chart provisions a control
+#    plane for an edge that never checks in, and the edge asks for one that was
+#    never provisioned.
+
+# 5. Edit them. The management file carries everything shared — domain,
+#    hostnames, node IPs, the edges list, the fleet-wide data policy. Each edge
+#    file carries only what is local to that site: its AE-title to XNAT-project
+#    map, its de-identification profile, its disk paths.
+$EDITOR sites/my-site/values.yaml        $EDITOR sites/my-site/secrets.enc.yaml
+$EDITOR sites/my-edge/values.yaml        $EDITOR sites/my-edge/secrets.enc.yaml
+
+# 6. Encrypt — do this before committing anything
+scripts/site-secrets.sh encrypt my-site
+scripts/site-secrets.sh encrypt my-edge
+
+# 7. Install
+./install.sh my-site
+
+# 8. PROVE IT WORKS. Do not skip this — `helm install` succeeding only means the
+#    objects were accepted, not that the fleet is actually working.
+make verify-live SITE=my-site
+```
+
+> **Back up `~/.config/sops/age/keys.txt`.** It is the only key that can decrypt
+> `sites/*/secrets.enc.yaml`, nothing can regenerate it, and losing it makes
+> every encrypted site file permanently unreadable. Put it in the team password
+> manager.
+
+### Then verify, every time
+
+```bash
+make verify-live SITE=my-site        # or: scripts/verify-live.sh my-site
+```
+
+This is the difference between "Helm accepted the manifests" and "a study sent
+to an edge will reach XNAT". It reads the SAME `sites/<site>/values.yaml` the
+install used, so it checks *your* hostnames, namespaces and edge list — nothing
+in it is hardcoded, and a deployment that keeps its data somewhere other than
+`/data` is checked where it actually lives.
+
+On this tier it walks the whole fleet: the management API server, node
+readiness, pod health per namespace, the `ais-edge-ca` Certificate and every
+Certificate derived from it, the SeaweedFS S3 Service, each edge's hosted
+control plane, and XNAT reachability. Its exit code is the number of failures.
+
+Run it:
+
+* after `install.sh`, always;
+* after adding an edge — a `join: bundle` edge in particular, because nothing
+  on the management side can tell you the operator actually ran the bundle;
+* after rotating a Secret or the CA;
+* after a reboot of the management node or any edge.
+
+> The edges' DICOM receivers listen on a **`hostPort`**, which is invisible from
+> inside the cluster, so verify-live cannot confirm them and does not pretend to.
+> Prove that leg with a real C-STORE from a machine that will send studies.
+
+### What each step does, and why it is not all Helm
+
+| Step | Does | Why it cannot be a chart |
+|---|---|---|
+| **1** | k0s, kubectl, helm, local-path-provisioner | there is no cluster yet |
+| **2** | cert-manager, then the k0smotron operator — both pinned | there are no CRDs yet, and cert-manager must exist **before** the chart |
+| **3** | site Secrets, SOPS → cluster | must precede the workloads that mount them |
+| **4** | `helm install` management chart | — |
+| **5** | child kubeconfig + join token, per edge | a Helm-rendered token would be re-minted on every upgrade |
+| **6** | join the edge worker — over SSH (`join: ssh`, the default), or by a self-contained bundle you carry to the site and run there (`join: bundle`, see **Edges** below) | the worker has to be joined from outside the cluster; with `join: bundle` the management node never touches it at all |
+| **7** | `helm install` edge chart, then seed cert-sync | — |
+
+#### Why cert-manager is a prerequisite, not a subchart
+
+The dependency is circular, and the loop is not obvious:
+
+```
+management chart renders `Cluster` (k0smotron.io) objects
+  └─▶ that CRD declares a CONVERSION WEBHOOK
+       └─▶ served by the k0smotron operator
+            └─▶ which will not start until cert-manager issues its serving cert
+                 └─▶ and cert-manager would be installed by the same chart
+```
+
+Setting `certManager.enabled: true` therefore fails on the first `Cluster`
+object with `conversion webhook … dial tcp …:443: connect: connection refused`,
+which reads as a networking fault rather than an ordering one. Keep it `false`;
+step 2 satisfies it.
+
+#### Why the installer seeds cert-sync immediately
+
+cert-sync is a CronJob (`23 */6 * * *`). On a fresh install that would leave the
+edge without its `ca-bundle`, its `loki-push-client-tls` and its
+`s3-edge-credentials` for up to six hours — and none of the three is optional:
+the s3-uploader mounts `ca-bundle` and reads its S3 key pair out of
+`s3-edge-credentials` as environment variables, and Vector mounts `ca-bundle`
+and `loki-push-client-tls`, so neither pod can start at all. Step 7 runs the
+CronJob's own pod spec once via `kubectl create job --from=cronjob`, so it
+cannot drift from what the schedule does later.
+
+The S3 key pair is delivered rather than written on the edge for the same
+reason the CA bundle is: it is one credential that would otherwise have to be
+typed identically into two files — `<edge>-s3` here, which SeaweedFS builds the
+edge's scoped identity from, and `s3-edge-credentials` there, which its uploader
+authenticates with. A mismatch stalls the pipeline at upload with an S3 403 and
+nothing says why, so the edge's own secrets file deliberately does not carry it.
+
+---
+
+## Configuration reference
+
+Everything below lives in `sites/<site>/values.yaml`.
+
+### Identity and addressing
+
+```yaml
+clusterLabel: mgmt              # label on this plane's own logs/metrics
+installMode: fresh              # fresh | existing (adopting a running k0s)
+topology: onprem                # onprem | cloud
+
+domain:
+  internal: aisedge.local       # internal DNS suffix; needs no real zone
+  mgmtNodeIP: "203.0.113.10"    # what the edges dial
+
+hostnames:                      # published on :443, routed by SNI
+  seaweedfs: seaweedfs.aisedge.local
+  grafana:   grafana.aisedge.local
+  loki:      loki.aisedge.local
+```
+
+The **child-cluster hostnames are deliberately absent here.** They used to be
+fleet-wide, which gave every edge the same `apiHost`, so a second site's Ingress
+claimed a hostname the first already owned and the fleet could not exceed one
+site. They are per-edge now, and the chart refuses to render if the old
+fleet-wide keys reappear.
+
+### Edges
+
+One entry per site. Each produces a hosted control plane, an S3 bucket, a scoped
+identity, an uploader and a reclaimer.
+
+```yaml
+edges:
+  - name: edge-dev
+    nodeIP: "203.0.113.20"
+    join: ssh                       # ssh (default) | bundle — see below
+    sshUser: ubuntu                 # join: ssh only — install.sh pushes the join
+    sshKey: ~/.ssh/id_ed25519       #   over ssh. OMIT BOTH for join: bundle.
+    s3SecretRef: edge-dev-s3
+    exposure: sni                   # sni | nodePort — use sni
+    # joinTokenTTL: 2h              # how long this edge's join token stays valid.
+    #                               # Default 2h. The ssh path spends it in
+    #                               # seconds; raise it only for a `join: bundle`
+    #                               # edge whose bundle has to travel further than
+    #                               # that. It is a BEARER credential — anything
+    #                               # holding it can join a node — so a longer
+    #                               # window is a deliberate decision.
+    # apiHost / konnectivityHost default to <prefix>-<name>.<domain>
+```
+
+**`join: bundle` — for an edge this node cannot reach.** A hospital behind a
+whitelisted-IP allowlist, a VPN or GlobalProtect has no inbound path, so the
+default push-over-SSH join cannot run. With `join: bundle`, `install.sh` writes
+a single self-contained `<edge>-join.sh` instead; you carry it to the site by
+whatever route you have and run `sudo bash <edge>-join.sh` there, and the
+installer waits for the node to appear. `sshUser`/`sshKey` are then unused.
+
+Only the one-time bootstrap differs — once joined, both modes are identical,
+because the edge dials *out* and nothing ever connects into the site. It is
+**not** an offline mode: the edge still needs permanent outbound reachability to
+this node on 443. Full walkthrough, guards and teardown caveat: `docs/TOUR.md`
+§4.1.
+
+**Use `exposure: sni`.** The control plane becomes a ClusterIP Service reached
+through the ssl-passthrough Ingress on :443 — which is already how the worker
+connects. Its ports are *Service* ports, which are per-Service, so **two sites
+can never collide and you allocate nothing**. Adding a site needs no port
+assignment at all.
+
+`nodePort` additionally reserves those numbers cluster-wide, which is the only
+reason a unique pair per site would be needed. Verified here: the worker dials
+`<mgmtNodeIP>:443` and the ingress routes to the Service ClusterIP — nothing
+dialled the node port from outside.
+
+If you do use `nodePort`, the numbers are explicit on purpose: deriving them from
+list position means inserting a site renumbers every site after it, and the
+Service carries `resource-policy: keep`, so the change would silently fail to
+apply.
+
+> Migrating an existing site `nodePort` → `sni` works, with one manual step:
+> k0smotron creates a new ClusterIP Service and leaves the old NodePort one
+> behind holding the ports. Once the new Service has endpoints, delete it:
+> `kubectl -n <edge> delete svc kmc-<edge>-nodeport`.
+
+**Measured cost:** ~231Mi per uploader. On a 16Gi management node that is a
+practical ceiling around **15 sites**.
+
+### Edge-local configuration
+
+`sites/<edge>/values.yaml` carries only what is genuinely local — the AE-title
+map, the de-identification profile, and storage paths. Everything else is
+**derived** from the management site file, which is passed to the edge release
+as well:
+
+| Derived | From |
+|---|---|
+| `upload.s3.endpoint` | `hostnames.seaweedfs` or `seaweedfs.<domain.internal>` |
+| `upload.s3.bucket` | `<bucketPrefix>-<clusterLabel>` when `perSiteBuckets` |
+| `observability.loki.endpoint` | `hostnames.loki` or `loki.<domain.internal>` |
+| `hostAliases` | `domain.mgmtNodeIP` + the hostnames edge pods actually dial |
+
+Each of those used to be typed a second time, and **every mismatch in that group
+fails silently** — the uploader retries an endpoint that will never answer,
+correctly preserves its local copy, and the management side, which watches for
+arrivals rather than absences, reports nothing wrong.
+
+### De-identification
+
+```yaml
+orthanc:
+  aet: AISEDGE
+  deid:
+    enabled: true
+    existingSaltSecret: orthanc-deid-salt
+    aetMap:
+      AISEDGE: {project: my_project}
+    profile:
+      DeidMode: modify
+      RemovePrivateTags: false
+      Keep: [StudyInstanceUID, SeriesInstanceUID, SOPInstanceUID, FrameOfReferenceUID]
+      Replace:
+        PatientIdentityRemoved: 'YES'
+        PatientName: ANONYMOUS
+        PatientID: ${ProjectCode}-${SubjectHash}
+```
+
+* **`deid.policyReviewed` has no default.** The chart refuses to render until a
+  human asserts they have read the profile and the AE-title map for this site. It
+  lives at the top level next to `deid.engine`, not under `orthanc:`, because it
+  gates every engine and not just the Lua one.
+* **UIDs are retained** so a study stays internally consistent across series.
+* **An unmapped AE title is quarantined, not dropped** — see
+  `dataPolicy.originals.quarantine`.
+* **The HMAC salt must survive reinstalls.** The same patient hashed with a
+  different salt becomes a different pseudonym, so rotating it splits one
+  subject into two in XNAT.
+
+---
+
+## Secrets
+
+The charts never contain credentials. They reference Secrets by name, and those
+Secrets are created separately from a SOPS-encrypted file.
+
+```bash
+scripts/site-secrets.sh new <site> <mgmt|edge>       # scaffold; the ROLE is required
+scripts/site-secrets.sh add-edge <mgmt-site> <edge>  # scaffold an edge AND mint its S3 key pair
+scripts/site-secrets.sh encrypt <site>               # before committing
+scripts/site-secrets.sh edit <site>                  # decrypt → $EDITOR → re-encrypt
+scripts/site-secrets.sh view <site>                  # print decrypted (careful: terminal)
+scripts/site-secrets.sh apply <site>                 # decrypt straight into the cluster
+scripts/site-secrets.sh check                        # fail if any committed secret is plaintext
+```
+
+**`new` does not guess the role.** An edge scaffolded from the management
+template renders perfectly — Helm ignores values a chart does not declare — and
+then silently overrides the fleet's `dataPolicy` from the wrong file; a
+management site scaffolded from the edge template is missing every hostname the
+edges derive their endpoints from. Both fail much later and in the least obvious
+way, so the argument is mandatory rather than defaulted.
+
+**Use `add-edge` to onboard an edge**, not `new … edge`. It scaffolds
+`sites/<edge>/`, mints the edge's S3 key pair once, and writes it into the
+management secrets file as `<edge>-s3` — the one credential that still has to
+exist in two places, and the last one a human could mismatch by hand. It
+deliberately does **not** edit the management `values.yaml`: that file is the
+most heavily annotated in the repo and a YAML round-trip would destroy every
+caution comment in it, so it prints the `edges:` block for you to paste, along
+with the steps it cannot do for you.
+
+`apply` pipes the plaintext directly into `kubectl` — it never touches disk. It
+also creates any namespace its Secrets name, which is what makes
+**secrets-before-workloads** possible on a bare cluster.
+
+Only `data` and `stringData` are encrypted. Names, namespaces and keys stay
+readable, so `git diff` shows *which* credential changed without showing it, and
+tooling can read structure without decrypting.
+
+### Namespaces are part of the contract
+
+A Secret is only readable from its own namespace, and for this chart nearly
+everything — SeaweedFS, Loki, Grafana, Alertmanager — runs in the **release**
+namespace. Only the uploader/reclaimer run in `xnat-upload`. Getting this wrong
+installs cleanly and leaves pods in `CreateContainerConfigError` with nothing in
+the chart to tell you why, so `make secret-contract` checks it.
+
+---
+
+## Data policy — what is kept and for how long
+
+One block governs every store, and it is passed to **both** charts so a site has
+exactly one answer.
+
+```yaml
+dataPolicy:
+  enabled: false      # nothing expires until you turn this on
+  dryRun: true        # decisions are logged, never acted on
+
+  originals:                                   # the archive of record
+    allowExpiry: false  # the THIRD switch — while false the facility-backup
+                        # volume is mounted read-only and no original is removed
+    facilityBackup: {retain: forever, minFreeDiskPercent: 10}
+    quarantine:     {retain: forever, alertAfter: 24h}
+    fileDrop:       {reclaim: never,  minAge: 30d}
+
+  derived:                                     # reproducible from the originals
+    orthancStorage: {reclaim: onGrouped,       minAge: 7d}
+    grouped:        {reclaim: onAssigned}      # no minAge: assign unlinks at
+                                               #   assign time, so only orphans
+                                               #   reach the engine; setting it
+                                               #   is rejected at render
+    assigned:       {reclaim: onUploaded,      minAge: 0}
+    s3Staged:       {reclaim: onXnatConfirmed, minAge: 1d,
+                     verifyAgainstXnat: true, maxRemovals: 50,
+                     schedule: "17 * * * *"}
+    # upload.mode: direct only. NOT a stage of its own: it is the delete
+    # authority for whichever tree above is TERMINAL under the chosen deid
+    # engine (/data/assigned under Orthanc-deid, /data/deidentified under
+    # ais-deid). Under upload.mode: s3 it does not render at all, because the
+    # s3-uploader's marker already answers the same question there.
+    stagedReclaimer: {minAge: 1d, verifyAgainstXnat: true,
+                      maxRemovals: 50, schedule: "17 * * * *",
+                      deadlineSeconds: 3000}
+
+  telemetry:
+    # the kubelet rotates by size x count, not by time. 10Mi x 5 = 50Mi
+    # of on-disk log per container.
+    podLogFiles: {maxSize: 10Mi, maxFiles: 5}
+```
+
+**Loki and Prometheus retention are not set here.** Helm cannot template a
+subchart's values from the parent, so keys under `telemetry` for them would read
+exactly like policy and do nothing — an operator could edit them, see a clean
+install, and keep the old retention indefinitely with nothing to say so. Setting
+`telemetry.loki` or `telemetry.prometheus` is now **rejected at render time**.
+Set retention where it is actually read, in the same `sites/<site>/values.yaml`:
+`kube-prometheus-stack.prometheus.prometheusSpec.retention` for Prometheus and
+`loki.loki.limits_config.retention_period` for Loki. `podLogFiles` is likewise
+not a duration — the kubelet rotates container logs by size and count only, so a
+window it could never honour was unimplementable rather than merely unwired. It
+is applied as `--kubelet-extra-args` at **worker-join time**, on both join paths,
+so changing it affects workers joined afterwards; an already-joined node needs its
+k0s worker service reinstalled, and `make verify-live` fails on the mismatch
+rather than letting the edit look applied.
+
+Three properties worth understanding:
+
+**Every derived rule is `(condition AND minAge)` — both must hold.** A pure age
+rule would expire a session that never reached XNAT because a credential was
+wrong. A pure condition rule frees nothing once the signal breaks.
+
+**`onXnatConfirmed` verifies content, not existence.** XNAT creates the
+experiment on the first resource POST, so "the experiment exists" is true even
+for a partial upload. The reclaimer sums every `__MANIFEST__.json` into a set of
+`filename → MD5`, lists what XNAT actually holds, and deletes only when
+`missing == 0 AND mismatched == 0`. Every uncertainty — an unreadable manifest,
+a 500 from XNAT, an unparseable listing — resolves to **keep**.
+
+**`maxRemovals` bounds a bug.** A run that decided "delete everything" is capped
+per run, leaving the rest for somebody to notice. At the hourly schedule this
+still drains ~1200 sessions/day.
+
+**A fresh install expires nothing.** Run with `dryRun` for a week and read the
+decisions it logs before enabling it.
+
+**Originals need a third switch.** `enabled` and `not dryRun` arm the *derived*
+stages only. A duration on `originals.facilityBackup` or `originals.quarantine`
+does nothing until `dataPolicy.originals.allowExpiry` is also true — the
+`edge-data-policy` DaemonSet logs `expiry_skipped` instead, and the chart keeps
+the facility-backup volume mounted read-only, so the kernel refuses the delete
+even if the engine were wrong. Deleting an original destroys the only
+identifiable copy, so it takes its own deliberate act on top of the other two.
+Full truth table: `docs/TOUR.md` §5c.
+
+---
+
+## Security model
+
+| Boundary | Mechanism |
+|---|---|
+| Hospital → management | Outbound TLS only. No inbound route to the edge. |
+| Between edge sites | **One S3 bucket per site.** SeaweedFS matches identity actions as `<action>:<bucket>` with **no prefix scoping**, so a shared bucket would let any edge key read and delete every other site's staged imaging. The bucket is the only boundary there is. |
+| Edge → XNAT | The edge has **no XNAT credential**. Only the management uploader does. This is the main operational advantage of `upload.mode: s3`. |
+| S3 ingestion | Per-edge **SigV4 key pair**, scoped to that site's bucket (the row above). Optionally a second factor: `seaweedfs.ingress.clientCerts` adds a per-edge **client certificate**, verified at the SeaweedFS Ingress with the same `auth-tls-*` annotations the Loki path uses — the key pair is a bearer secret usable from anywhere, the certificate is a private key that never leaves the site and rotates every 90 days. **Ships off**, and turning it on is a four-step rollout (`issue` → confirm `s3-client-tls` landed → edge `requireClientCert` → `require`): flipping verification on before the certificates arrive breaks every upload with an error that names nothing — measured, the handshake succeeds, nginx answers HTTP 400, and rclone reports it as an S3 XML parse failure, so it reads as a dead endpoint. See `docs/components/seaweedfs.md`. |
+| Loki ingestion | Per-edge **client certificate (mTLS)**, verified at the Ingress (`auth-tls-verify-client: on`, with `auth-tls-match-cn` pinned to the names in `edges`). cert-manager issues one `<edge>-loki-client` certificate per site and cert-sync delivers it as `loki-push-client-tls`. Loki itself runs `auth_enabled: false`, so the Ingress is the only place it is checked. The CN pin admits every site on the one push hostname, so it bounds *which* certificates are accepted, not one edge writing under another's name. |
+| TLS | Internal CA via cert-manager. An https S3 endpoint with no CA bundle is **refused at render time** — an empty `AWS_CA_BUNDLE` silently disables verification rather than falling back to the system store. |
+| Credentials at rest | SOPS + age. Never in a values file, never in a ConfigMap, never in git. |
+| CA private key | `tls.key` can never be copied to an edge — cert-sync refuses to render it. |
+
+`install.sh` also **refuses to install** if `sites/<site>/secrets.enc.yaml` is
+not SOPS-encrypted, or — when `sops` is on `PATH` — if any *value* in it is
+still an unfilled `REPLACE_` placeholder. It decrypts to a pipe, never to disk,
+and checks the values rather than the file text: the templates' own comments say
+"fill in every REPLACE_", so grepping the whole file refused to install a
+complete, correct site. Note the two limits of that check: `sops` is not in the
+required-tools list, so on a node without it the placeholder check is skipped
+entirely, and **nothing anywhere enforces a minimum length or strength** on a
+credential you did fill in. The check exists because the template once shipped
+working defaults annotated "change defaults", and the first deployment ran with
+them unchanged — a comment is advice, and advice does not fail an install.
+
+---
+
+## Observability and alerting
+
+Prometheus scrapes the management plane. Loki receives logs from every edge via
+Vector. Alerts come from **two** sources:
+
+* **Prometheus rules** — resource and certificate conditions.
+* **Loki ruler rules** — pipeline conditions, derived from the JSON log events
+  the pipeline emits. These live in the ruler rather than Prometheus because the
+  management Prometheus cannot scrape edge pods across the one-way konnectivity
+  tunnel, and because the source of truth is the log event, not a derived metric.
+
+The uploader's log schema is a **public interface**. `upload_started`,
+`upload_completed` and `upload_failed` are matched by three Loki ruler alert
+rules — `XNATUploadFailingForAllSessions`, `S3UploaderRetryStorm` and
+`SessionUploadStalled`, five event matchers between them in
+`charts/mgmt/files/loki-ruler-rules.yaml` — and by eight Grafana dashboard
+panels; renaming one disables the corresponding alert silently.
+
+```bash
+# Does every alert actually have the metrics it depends on?
+scripts/check-alert-inputs.sh
+```
+
+That script asks the **live** Prometheus whether each alert's inputs have any
+series at all. It is how three alerts were found that had never been able to
+fire — including certificate expiry, on a fleet where every edge validates
+against a CA that must be rotated in two phases weeks apart.
+
+---
+
+## Repository structure
+
+```
+install.sh                     the only entrypoint
+Makefile                       CI entrypoint (make ci-fast / make ci), and
+                               make verify-live SITE=<site>, which is NOT CI
+sites/
+  example-mgmt/                template for THE management node (one per deployment)
+  example-edge/                template for ONE edge node (one per facility)
+  <site>/values.yaml           SINGLE SOURCE OF TRUTH for a deployment. The
+                               management file is passed to BOTH charts, so
+                               anything shared is written here exactly once;
+                               each edge file is passed after it and carries
+                               only what is local to that site.
+  <site>/secrets.enc.yaml      SOPS-encrypted; charts reference these by name
+charts/
+  mgmt/                        management chart
+    templates/                 seaweedfs, xnat-upload, observability,
+                               cert-issuers, cert-sync, edge-clusters
+    files/                     reclaim-staged.sh, cert-sync.sh, ruler rules
+  edge/                        edge chart
+    templates/                 orthanc, ingest-pipeline, upload, vector, storage
+    files/                     s3-uploader.sh, deidentify-and-forward.lua,
+                               vector.yaml
+scripts/
+  site-secrets.sh              create / encrypt / apply site secrets
+  verify-live.sh               read-only checks against a RUNNING deployment
+  uninstall.sh                 full reset
+  01,05,06,06b,06c             bootstrap steps Helm cannot do — 06 joins over
+                               SSH, 06b builds the carry-over bundle for an edge
+                               with no inbound path, 06c is the post-join work
+                               both paths share
+  files/edge-join.sh           the join itself; runs ON the edge, identical for
+                               both paths
+  adopt-existing.sh            take over a running imperative install
+  rotate-ca.sh                 two-phase CA rotation across the fleet
+  clear-staged-s3.sh           clear the S3 staging prefix; empty session
+                               prefixes only, unless you pass --all
+  check-alert-inputs.sh        ask live Prometheus whether alerts can fire
+  ci/                          CI stages (render, negative, promtool, …), one
+                               script per stage, invoked by the Makefile
+tests/
+  reclaimer/                   45 cases asserting on what was DELETED, both backends
+  loki-rules/                  the real Loki rule expressions, against fixture
+                               logs, evaluated by the pinned Loki
+  data-policy/                 the real engine under the real image, asserting
+                               on what SURVIVED
+config/k0s-controller.yaml     the management k0s controller config (scripts/01)
+manifests/01-management/       the k0smotron Cluster template rendered by
+                               scripts/05, one per edge
+docs/                          component guides, CA ceremony, alerting design
+```
+
+---
+
+## Continuous integration
+
+```bash
+make ci-fast     # no cluster, no docker
+make ci          # adds the three docker-based stages: loki-rules, data-policy,
+                 # greenfield
+
+make verify-live SITE=<site>   # NOT CI — read-only checks against a RUNNING
+                               # deployment. See "Then verify, every time".
+```
+
+| Stage | Proves |
+|---|---|
+| `render` | both charts render across 40 value combinations |
+| `negative` | 57 render-time guards each fire on the condition they claim to detect, plus a census that fails if a guard is added without a case |
+| `promtool` | 16 alert-rule unit tests — each rule fires on the condition it describes |
+| `shell-syntax` | every script parses; no `yes \|` pipeline under `pipefail` |
+| `pvc-retention` | nothing holding data can be auto-deleted |
+| `runtime-templates` | scripts survive Helm rendering |
+| `duplicate-names` | no two objects collide |
+| `reclaimer` | 45 cases, asserting on **what was deleted**, not on log text. 34 drive the S3 backend through stub `aws`/`curl` binaries; 11 drive the filesystem backend against a real directory tree, where the assertion is that the session directory is gone |
+| `secret-contract` | every mounted Secret exists, in the right namespace, with the right keys |
+| `values-consumers` | every values key that declares a behaviour has something reading it — Helm never warns about a value nobody consumes |
+| `loki-rules` | the real Loki ruler expressions, evaluated against fixture logs by the pinned Loki — promtool covers only the Prometheus rules |
+| `data-policy` | the edge retention engine, run under the real busybox image the chart deploys, asserting on **what survived** |
+| `greenfield` | the charts install onto an empty cluster |
+
+The last three need docker. They **skip loudly** without it, and the skip is
+reported separately from a pass, so a docker-less run never reads as "the charts
+are installable". `CI_REQUIRE_LOKI_TESTS`, `CI_REQUIRE_DATAPOLICY_TESTS` and
+`CI_REQUIRE_GREENFIELD` turn each skip into a failure, which is what the GitHub
+workflow sets.
+
+Two of these exist because of specific classes of silent failure:
+
+**The reclaimer is the only component that deletes patient data**, so it is
+tested by asserting on the deletes. A run that logs `reclaim_kept` and issues a
+DELETE anyway would pass a log-only test and fail this one. Its `aws` and `curl`
+are stubbed and **fail by default** for anything a case does not configure — a
+stub that invented a plausible success would test the opposite of the property
+that matters.
+
+**`secret-contract`** renders both charts and fails if any mounted Secret is
+absent, in the wrong namespace, or missing a key. A wrong namespace and a
+missing key fail identically and silently at runtime: helm reports success and
+the pod sits in `CreateContainerConfigError`.
+
+---
+
+## Operating
+
+### Health
+
+Start with `make verify-live SITE=<site>` — it reads the site file and checks
+the whole fleet in one pass, so the one-liners below are for when it has told
+you *where* to look, or when you want a number it does not report.
+
+```bash
+helm list -A
+kubectl get pods -A
+kubectl --kubeconfig kubeconfig-<edge> get pods -A
+
+# S3 buckets and sizes
+kubectl -n ais-mgmt exec deploy/mgmt-seaweedfs -c seaweedfs -- \
+  sh -c 'echo "s3.bucket.list" | weed shell -master=localhost:9333'
+
+# certificates
+kubectl get clusterissuer
+kubectl -n cert-manager get certificate
+```
+
+### Send a test study
+
+```bash
+dcmsend <orthanc-pod-ip> 4242 -aec AISEDGE study.dcm
+```
+
+Then follow it: Orthanc logs (`Lua says: {"backupPath": …}`) →
+`/data/facility-backup` → study labelled `xnat-ingest-ready` → `/data/grouped` →
+`/data/assigned` → `upload_completed` in the s3-uploader log →
+`s3://ingest-<edge>/staged/` → the management uploader log.
+
+Note that **re-sending the same file produces no upload notification**. DICOM
+UIDs are deterministic, so Orthanc deduplicates it into a study already labelled
+`xnat-ingest-processed`, and the uploader reports
+`Skipping upload … as all the resources already exist on XNAT`. That is correct
+idempotence, not a failure. Use a different study to test a fresh write.
+
+### Adding an edge
+
+An `edges:` entry alone is not enough — the new site also needs its own
+`sites/<edge>/` directory and an S3 key pair. Without them `install.sh` dies at
+step 7/7 with `missing sites/<edge>/values.yaml`, *after* the hosted control
+plane is up and the worker has joined, which is the expensive half.
+
+```bash
+# 1. scaffold sites/<edge>/ and generate its S3 key pair into the management
+#    secrets file as <edge>-s3 (cert-sync delivers it to the edge as
+#    s3-edge-credentials; do not write it on the edge side). Prints the
+#    'edges:' block to paste.
+scripts/site-secrets.sh add-edge <site> <edge>
+
+# 2. the AE-title map, de-identification profile and disk paths — facts only
+#    you have, so nothing generates them
+$EDITOR sites/<edge>/values.yaml
+
+# 3. the de-identification salt. The template ships
+#    AIS_DEID_HMAC_SALT: REPLACE_64_HEX_CHARS, and it is deliberately NOT
+#    auto-generated: it must survive reinstalls, and silently regenerating it
+#    would re-pseudonymise every existing patient.
+openssl rand -hex 32
+$EDITOR sites/<edge>/secrets.enc.yaml
+
+# 4. paste the printed block under 'edges:'. s3SecretRef must be <edge>-s3 —
+#    cert-sync substitutes <edge> and nothing else, and the chart refuses to
+#    render if the two disagree.
+$EDITOR sites/<site>/values.yaml
+
+# 5. encrypt the new edge before committing (add-edge already re-sealed the
+#    management file if it was encrypted)
+scripts/site-secrets.sh encrypt <edge>
+
+# 6. install, then prove it
+./install.sh <site>
+make verify-live SITE=<site>
+```
+
+Existing sites are untouched; the new one gets its own control plane, bucket,
+identity, uploader and reclaimer. Full walkthrough: `docs/TOUR.md` §5b.
+
+### Removing an edge
+
+Remove its entry from `edges:`, then `helm upgrade`. Reset the worker with
+`k0s reset` on the edge machine. The staged data and the SeaweedFS identity are
+removed with the entry.
+
+### CA rotation
+
+Two phases, weeks apart — see `docs/ca-ceremony.md`. cert-sync distributes the
+new bundle to every edge on its schedule, so rotation does not require visiting
+each site. `CertificateExpiringSoon` fires at 60 days.
+
+---
 
 ## Troubleshooting
 
-**k0s worker not joining:**
-- Check token: `sudo cat /etc/k0s/join-token | head -c 50` (should not be empty)
-- Verify the embedded URL: `cat /etc/k0s/join-token | base64 -d | gunzip | grep server`
-  (should show `https://k0s.aisedge.local:443`)
-- Check `/etc/hosts` has the aisedge.local entries: `grep aisedge /etc/hosts`
-- Check connectivity: `curl --cacert /tmp/ais-edge-ca.crt https://k0s.aisedge.local/version`
-  (TLS error = cert/CA mismatch; refused = nginx-ingress / network)
-- Check logs: `sudo journalctl -u k0sworker --no-pager -n 30`
-- Note: `k0s status` does NOT work on workers. Use `systemctl is-active k0sworker`.
+| Symptom | Cause |
+|---|---|
+| Edge pods `CreateContainerConfigError` | A Secret is missing. Most often `ca-bundle`, `loki-push-client-tls` or `s3-edge-credentials`, all three delivered by cert-sync — run its job manually: `kubectl -n ais-mgmt create job x --from=cronjob/mgmt-cert-sync-<edge>` |
+| `helm install` fails with `conversion webhook … connection refused` | The k0smotron operator is not ready. It needs cert-manager, which must be installed *before* the chart. |
+| `invalid ownership metadata` on install | An object exists without Helm's ownership labels, usually from a previous non-Helm install. `scripts/uninstall.sh` clears these. |
+| Worker join times out | On a `join: bundle` edge, first check the obvious one: the bundle has not been run on the edge yet — the installer is waiting for the node to appear and 06c says so on timeout. Otherwise the management node cannot resolve its own child-cluster API: check `/etc/hosts` has the `aisedge` entries — a partial teardown that removed the entries but left the marker comment causes the installer to skip re-adding them. |
+| Uploader retries forever, no error on the management side | The edge cannot reach the S3 endpoint. Check `hostAliases` resolve and the CA bundle is present. The edge correctly preserves its local copy, so the only symptom is an absence. |
+| `XNATAuthFailure` while uploads succeed | Was a false positive from `xnat-ingest` progress-bar output matching bare `401`/`403`. Fixed; the rule now requires HTTP context and drops `it/s` lines. |
+| Loki logs `NoSuchBucket` at startup | Non-fatal. The bucket-creation hook is `post-install`, so Loki retries its chunk store until the bucket appears. It converges without restarting. |
 
-**konnectivity-agent in CrashLoop / "lookup konnect.aisedge.local: no such host":**
-- The child cluster's CoreDNS does not have the aisedge.local hosts entry.
-  Re-run `06-join-edge-worker.sh` (idempotent) or apply the Corefile manually.
-- Verify: `KUBECONFIG=kubeconfig-<edge> kubectl get cm coredns -n kube-system -o jsonpath='{.data.Corefile}' | grep aisedge`
+---
 
-**s3-uploader: "x509: certificate signed by unknown authority":**
-- The `ca-bundle` Secret is missing or empty on the edge cluster. Re-run
-  `07-deploy-edge-ingest.sh <edge-entry>` — it pushes `ais-edge-ca.crt` to the
-  edge cluster's `xnat-ingest/ca-bundle` Secret and rolls the s3-uploader.
-- Verify: `KUBECONFIG=kubeconfig-<edge> kubectl get secret -n xnat-ingest ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d | openssl x509 -noout -subject`
+## Orthanc REST API Authentication
 
-**Pods stuck in Pending:**
-- Check events: `kubectl describe pod <name> -n <namespace>`
-- Common cause: no StorageClass (management cluster needs local-path-provisioner)
-- Edge pods use hostPath, not PVC — check directory exists on worker
+The shipped edge site sets `orthanc.auth.enabled: false`. Orthanc's REST API is
+`ClusterIP`-only, so nothing outside the cluster can reach it — but that is an
+accident of network placement, not a control. Anything running *inside* the
+cluster can call that API, and it can **delete studies**. Turn it on for any
+deployment where that matters.
 
-**xnat-ingest sort puts files in __invalid__:**
-- The DICOM file is missing required metadata (usually AccessionNumber)
-- This is normal for sample files. Rename and move manually for testing.
-- With real clinical DICOMs, this won't happen.
+Three keys, all required, because two different things read this Secret:
 
-**Upload pod can't reach SeaweedFS:**
-- The mgmt upload pod uses in-cluster DNS — TLS/Ingress not involved.
-  Test: `kubectl exec -n xnat-upload deploy/xnat-ingest-upload -- curl -s http://seaweedfs.seaweedfs.svc.cluster.local:8333/`
-- Check SeaweedFS pod: `kubectl logs -n seaweedfs -l app=seaweedfs`
+| Key | Read by | If it is wrong |
+| --- | --- | --- |
+| `users.json` | Orthanc itself, via `RegisteredUsersFile` | Orthanc fails to start — the file its config points at was never mounted |
+| `orthanc-user` | `group-orthanc`, calling the REST API | Orthanc answers 401 and the pipeline stalls with data sitting in Orthanc |
+| `orthanc-password` | `group-orthanc` | as above |
 
-**Upload pod can't reach XNAT:**
-- Test: `curl -sk <XNAT_URL>`
-- Check XNAT credentials in management cluster secret
-- XNAT project must exist before upload (create in XNAT web UI)
+`orthanc-user` / `orthanc-password` **must match** the user and password inside
+`users.json`. They are separate keys because Orthanc wants a file and
+`group-orthanc` wants environment variables; nothing reconciles them for you.
 
-**Server cert about to expire (or compromised CA):**
-- Server certs auto-renew via cert-manager (1-year duration, 30-day renewBefore).
-- Force renewal: `kubectl delete secret seaweedfs-tls -n seaweedfs` and cert-manager
-  re-issues from the CA Issuer.
-- Full CA rotation: `scripts/rotate-ca.sh --phase=1` then (after 14-30 days) `--phase=2`.
+**1. Generate a password and add the Secret.**
 
-## Using AWS S3 Instead of SeaweedFS
-
-This setup uses self-hosted SeaweedFS by default, but you can swap it for AWS S3 (or any
-S3-compatible service like Google Cloud Storage, Backblaze B2, MinIO, Garage, Ceph RGW)
-with minimal changes — `mc` and `boto3` speak vanilla S3.
-
-### What Changes
-
-| Component | SeaweedFS (default) | AWS S3 |
-|-----------|--------------------|--------|
-| Storage server | SeaweedFS pod on management node | AWS managed service |
-| Management manifests | `manifests/01-management/seaweedfs.yaml.tpl` deployed | **Not deployed** — skip step 03 |
-| Upload pod S3 endpoint | `http://seaweedfs.seaweedfs.svc.cluster.local:8333` | `https://s3.amazonaws.com` (default) |
-| Edge S3 endpoint | `https://seaweedfs.aisedge.local` (TLS, ais-edge-ca) | `https://s3.<region>.amazonaws.com` (TLS, public CA) |
-| Credentials | SeaweedFS s3.json identities | AWS IAM access keys |
-
-### Step-by-Step
-
-**1. Create AWS resources:**
 ```bash
-# Create an S3 bucket
-aws s3 mb s3://my-ingest-bucket --region ap-southeast-2
-
-# Create an IAM user for the edge (write-only)
-aws iam create-user --user-name edge-writer
-aws iam put-user-policy --user-name edge-writer --policy-name write-only --policy-document '{
-  "Version": "2012-10-17",
-  "Statement": [
-    {"Effect":"Allow","Action":["s3:PutObject","s3:DeleteObject"],"Resource":"arn:aws:s3:::my-ingest-bucket/*"},
-    {"Effect":"Allow","Action":["s3:ListBucket","s3:GetBucketLocation"],"Resource":"arn:aws:s3:::my-ingest-bucket"}
-  ]
-}'
-aws iam create-access-key --user-name edge-writer
-# → note the AccessKeyId and SecretAccessKey
-
-# Create an IAM user for the management upload pod (read + delete)
-aws iam create-user --user-name mgmt-reader
-aws iam put-user-policy --user-name mgmt-reader --policy-name read-delete --policy-document '{
-  "Version": "2012-10-17",
-  "Statement": [
-    {"Effect":"Allow","Action":["s3:GetObject","s3:DeleteObject","s3:ListBucket","s3:GetBucketLocation"],"Resource":["arn:aws:s3:::my-ingest-bucket","arn:aws:s3:::my-ingest-bucket/*"]}
-  ]
-}'
-aws iam create-access-key --user-name mgmt-reader
+openssl rand -base64 24                       # use this as <password> below
+scripts/site-secrets.sh edit <site>           # decrypts to $EDITOR, re-encrypts on save
 ```
 
-**2. Update config files:**
+Add this document (the template is already in your `secrets.enc.yaml`, commented
+out — uncomment and fill it in):
 
-`config/management.env`:
-```bash
-export S3_BUCKET="my-ingest-bucket"
-# These become the management upload pod's AWS credentials:
-export S3_ADMIN_ACCESS_KEY="<mgmt-reader-access-key>"
-export S3_ADMIN_SECRET_KEY="<mgmt-reader-secret-key>"
-```
-
-`config/edge-nodes.env`:
-```bash
-EDGE_NODES=(
-  "edge-uqcai|203.101.230.171|ubuntu|~/.ssh/id_ed25519|uqcai-project|<edge-writer-access-key>|<edge-writer-secret-key>"
-)
-```
-
-**3. Modify manifests:**
-
-`manifests/01-management/xnat-upload.yaml.tpl` — remove the `AWS_ENDPOINT_URL` env var
-(so boto3 defaults to real AWS S3):
 ```yaml
-# DELETE this line:
-#   - name: AWS_ENDPOINT_URL
-#     value: "http://seaweedfs.seaweedfs.svc.cluster.local:8333"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: orthanc-credentials
+  namespace: xnat-ingest          # the EDGE site's namespace
+type: Opaque
+stringData:
+  users.json: '{"RegisteredUsers":{"admin":"<password>"}}'
+  orthanc-user: admin
+  orthanc-password: <password>
 ```
 
-`manifests/02-edge/xnat-ingest.yaml.tpl` — change the s3-uploader endpoint env to AWS S3:
+The password is **plaintext inside that JSON** — Orthanc has no hashed-password
+format here. That is precisely why this file is SOPS-encrypted before it is
+committed, and why `scripts/site-secrets.sh check` refuses a plaintext one.
+
+**2. Turn it on in the site file.**
+
 ```yaml
-# Change the S3_ENDPOINT value to:
-value: "https://s3.ap-southeast-2.amazonaws.com"
+orthanc:
+  auth:
+    enabled: true
+    existingSecret: orthanc-credentials
 ```
 
-**4. Install — skip step 03 (SeaweedFS):**
+The chart refuses to render if `enabled: true` and `existingSecret` is empty —
+the deployment mounts that Secret non-optionally, so an empty name would fail
+as a confusing volume error rather than an auth one.
 
-When running `./install.sh`, press `s` at step 03 to skip SeaweedFS deployment.
-Everything else remains the same.
-
-### Advantages of AWS S3
-
-- No SeaweedFS to manage, monitor, or back up
-- Automatic redundancy and durability (11 nines)
-- Cross-region replication available
-- Pay-per-use (no disk provisioning)
-- IAM policies are more granular than SeaweedFS's
-
-### Advantages of SeaweedFS (self-hosted)
-
-- Data never leaves your infrastructure (important for patient data pre-de-identification)
-- No cloud costs
-- No internet dependency between management and storage
-- Full control over data residency and compliance
-
-## TLS / Self-Signed CA
-
-All edge ↔ management traffic flows over a single TLS port (443) multiplexed by
-SNI. Three components make this work:
-
-**1. Self-signed root CA — `ais-edge-ca`**
-- Created by cert-manager at install time (script `02b-bootstrap-ca.sh`).
-- 10-year duration, 4096-bit RSA, stored as a Secret in the `cert-manager` namespace.
-- The PUBLIC half is exported to `ais-edge-ca.crt` (gitignored, distributed to edges).
-- The PRIVATE half NEVER leaves the management node.
-
-**2. Server certs (per service)**
-- cert-manager issues 1-year RSA certs signed by `ais-edge-ca`.
-- Auto-renewed 30 days before expiry — no site action required.
-- Servers: `seaweedfs.aisedge.local` (and any future TLS-fronted service).
-- The k0smotron-managed k0s API + konnectivity have their own internal CA — those
-  certs include the aisedge.local hostnames as SANs (configured via `spec.k0sConfig.spec.api.sans`).
-
-**3. Edge trust**
-- Each edge cluster gets a Secret `xnat-ingest/ca-bundle` containing `ais-edge-ca.crt`.
-- The `s3-uploader` pod mounts it at `/root/.mc/certs/CAs/ca.crt` so `mc` trusts our CA.
-- Edge worker kubelet: standard k0s mTLS — kubelet uses the auto-generated kubeconfig
-  CA cert (k0smotron's CA, not `ais-edge-ca`) for API server verification.
-
-**Hostname resolution without DNS:**
-- Edge VMs get a static `/etc/hosts` entry: `<MGMT_IP> seaweedfs.aisedge.local k0s.aisedge.local konnect.aisedge.local`
-  (added by script `06-join-edge-worker.sh`).
-- Pods on the edge cluster get `hostAliases` (in the manifest) for the same hostnames.
-- The child cluster's CoreDNS gets a `hosts` plugin entry so the konnectivity-agent
-  (which uses cluster DNS, not host /etc/hosts) can also resolve them.
-
-**Trust chain at handshake time (e.g. mc upload from edge to SeaweedFS):**
-```
-edge mc client
-  ├─ resolves seaweedfs.aisedge.local → MGMT_NODE_IP (via /etc/hosts in pod)
-  ├─ opens TCP to MGMT_NODE_IP:443
-  ├─ TLS ClientHello includes SNI=seaweedfs.aisedge.local
-  ├─ mgmt nginx-ingress matches Ingress, terminates TLS using seaweedfs-tls Secret
-  ├─ presents server cert (signed by ais-edge-ca)
-  ├─ mc validates cert against /root/.mc/certs/CAs/ca.crt (= ais-edge-ca.crt)
-  └─ chain verifies → S3 PUT proceeds over TLS
-```
-
-**CA rotation:**
-
-When the CA is approaching expiry (or in a compromise scenario), use `scripts/rotate-ca.sh`:
+**3. Apply, and restart what reads it.**
 
 ```bash
-# Phase 1: issue NEW CA + push bundle (old + new) to all edges
-./scripts/rotate-ca.sh --phase=1
-
-# Wait 14-30 days for renewal cycles to settle.
-# During this window: BOTH CAs are trusted on edges. Server certs still
-# signed by the OLD CA. Pipeline keeps working.
-
-# Phase 2: switch the Issuer to NEW, re-issue all server certs, drop OLD from bundle
-./scripts/rotate-ca.sh --phase=2
+scripts/site-secrets.sh apply <site>
+./install.sh <site>
+KUBECONFIG=kubeconfig-<edge> kubectl -n xnat-ingest rollout restart deploy/<release>-orthanc
+KUBECONFIG=kubeconfig-<edge> kubectl -n xnat-ingest rollout restart deploy/<release>-group-orthanc
 ```
 
-Use `--dry-run` first to preview. Test in staging before running in production.
+Both restarts are needed: Kubernetes does not restart a pod when a Secret
+changes, and neither Orthanc nor `group-orthanc` re-reads one at runtime.
 
-## Observability
+**4. Verify.**
 
-Optional log-aggregation, metrics, dashboarding, and alerting stack:
+```bash
+# from inside the cluster — should now be 401 without credentials
+KUBECONFIG=kubeconfig-<edge> kubectl -n xnat-ingest exec deploy/<release>-orthanc -- \
+    curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8042/studies
+# and 200 with them
+KUBECONFIG=kubeconfig-<edge> kubectl -n xnat-ingest exec deploy/<release>-orthanc -- \
+    curl -s -o /dev/null -w '%{http_code}\n' -u admin:<password> http://localhost:8042/studies
+```
 
-- **Loki** stores logs (chunks land in a SeaweedFS `logs-bucket`)
-- **Prometheus** scrapes per-pod `/metrics` and stores time series
-- **Grafana** queries both, hosts pre-built dashboards
-- **Alertmanager** routes alerts via email (primary) and optional Slack
-- **Vector** runs as a DaemonSet on every worker (mgmt + edge) and ships
-  pod stdout to Loki over the same single 443 outbound port — adds two
-  more SNI routes (`grafana.aisedge.local`, `loki.aisedge.local`) to the
-  existing nginx-ingress; no new firewall rules.
+Then confirm the pipeline still moves: `group-orthanc`'s log should keep
+reporting `Found N studies`, not 401s. If it 401s, `orthanc-user` /
+`orthanc-password` disagree with `users.json`.
 
-The stack is optional. With `ALERT_EMAIL_TO` blank in `config/management.env`
-the install script skips it cleanly. Set the email + SMTP vars and re-run
-`./install.sh` (or `bash scripts/02d-install-observability.sh` and
-`bash scripts/07b-deploy-edge-observability.sh <edge-entry>` directly).
-
-Four dashboards land in Grafana under the `AIS Edge` folder:
-
-- **Pipeline Overview** — cross-cluster counters and timeseries for the
-  whole ingest pipeline (DICOMs vs S3 objects vs sessions, failures,
-  invalid sessions, per-edge throughput, recent events log).
-- **Edge Site Drilldown** — single-cluster + per-worker-node view with
-  dropdowns for `cluster` and `node`.
-- **Session Timeline** — single-session trace across edges and mgmt by
-  session name.
-- **SeaweedFS Health** — storage-layer metrics from Prometheus.
-
-For exactly what every panel measures, including the s3-uploader event
-schema and the difference between the `dicoms` and `files` fields, see
-[`docs/dashboards.md`](docs/dashboards.md). For the architectural reason
-edge-side alerts live in Loki ruler instead of mgmt Prometheus, see
-[`docs/alerting-architecture.md`](docs/alerting-architecture.md). For
-per-component detail (what each one stores, what it has access to, what
-the failure modes are, how to scale or replace it), see
-[`docs/components/`](docs/components/).
-
-## Konnectivity and Middleboxes
-
-Konnectivity is the reverse tunnel that lets the management API server reach
-back into worker components (`kubectl exec`, `kubectl logs`, `kubectl
-port-forward`, metrics scraping). On the edge it runs as
-`konnectivity-agent`, which dials out to `https://konnect.aisedge.local:443`
-and keeps a long-lived **HTTP/2 + gRPC over TLS** connection open. The
-management nginx-ingress forwards the raw TLS bytes through to the
-konnectivity-server inside the hosted control plane (SSL passthrough — nginx
-never decrypts).
-
-This protocol works through every standards-compliant firewall, but a few
-classes of network appliance can disrupt it. Worth flagging for site IT:
-
-- **Deep-packet-inspection / TLS-intercepting proxies.** Devices that
-  terminate TLS to scan traffic break the tunnel. Konnectivity uses mutual
-  cert verification; an interception proxy presents its own cert which the
-  agent will reject (`x509: certificate signed by unknown authority`). The
-  fix at the site is either to **bypass interception for the management
-  IP** or **install the proxy's CA into the agent's trust store**, but the
-  cleanest answer is bypass.
-- **Aggressive HTTP/2 stream timeouts.** Some firewalls and L7 load
-  balancers drop HTTP/2 streams that are idle for a few minutes. The
-  konnectivity tunnel uses long-lived streams (often >1h) for keepalive
-  and watch traffic. If the appliance kills the stream, kubelet briefly
-  disconnects from the control plane and the agent reconnects — usually
-  invisible, but `kubectl exec` and `kubectl logs` may stall during the
-  reconnect. Configure the appliance with **idle timeout ≥ 60 minutes**
-  on outbound 443 to the management IP.
-- **gRPC-aware filtering / QUIC enforcement.** A few enterprise proxies
-  block gRPC on port 443 by default, or rewrite responses to force
-  HTTP/1.1. Konnectivity requires HTTP/2 end to end; HTTP/1.1 downgrade
-  breaks it. Allow plain HTTPS/HTTP-2 to the management IP without
-  protocol rewriting.
-- **Stateful firewalls with short connection-tracking tables.** Same idle-
-  timeout class of issue as above. A flow that sees no packets for ~5 min
-  may get evicted from the conntrack table; keepalive on the agent should
-  prevent it but is occasionally too sparse on tightly-tuned appliances.
-
-If `kubectl logs` or `kubectl exec` against a child cluster suddenly stops
-working ("No agent available" in the API server logs), check the
-konnectivity-agent pod: `KUBECONFIG=kubeconfig-<edge> kubectl get pods -n
-kube-system -l k8s-app=konnectivity-agent`. Restarts on the agent are the
-classic symptom of a middlebox kicking the tunnel.
-
-The data path (DICOM upload via `mc mirror` to SeaweedFS) does NOT use
-konnectivity — it is plain HTTPS REST and tolerates short connection drops
-naturally. Konnectivity disruption affects only central-admin visibility, not
-data integrity.
+> **Do not expose port 8042 to the host or a NodePort just because auth is now
+> on.** `orthanc.expose.http` stays `ClusterIP`. Authentication is a second
+> layer here, not a replacement for keeping the API off the network.
 
 ## Uninstall
 
 ```bash
-./scripts/uninstall.sh
+scripts/uninstall.sh <site>                  # full reset, both nodes
+scripts/uninstall.sh --keep-cluster <site>   # workloads only, keep k0s running
 ```
 
-This removes everything: edge workers, SeaweedFS data, hosted clusters, k0smotron, and
-optionally k0s itself (if installed fresh). Resources removed include:
-- ingress-nginx (helm release + namespace)
-- ais-edge-ca Issuer + Secret + exported `ais-edge-ca.crt`
-- /etc/hosts entries on management and edge VMs
-- /etc/haproxy/certs/ on each edge worker
+The default is a genuine clean slate: both Helm releases, all namespaces, the
+CRDs and admission webhooks, cluster-scoped RBAC (including the Roles these
+components leave in `kube-system`), every PersistentVolume **and its host
+directory**, `/data` on every node, `/etc/hosts` entries **and their marker
+comments**, the generated kubeconfigs and join tokens, and `k0s reset` on the
+management node and each edge.
 
-## Network Ports
+**One exception, and it is loud: a `join: bundle` edge.** The remote half of a
+teardown runs over SSH, and a bundle site has no inbound path by definition. The
+script detects that — `join: bundle`, or an empty `sshUser` — warns that **the
+edge half is not done**, and prints the commands to run on the edge itself:
+`k0s stop`, `k0s reset`, the `/data`, `/var/lib/k0s`, `/etc/k0s` and
+`/var/lib/vector` wipe, the `/etc/hosts` line, and a reboot to clear CNI
+interfaces and iptables state. That check exists because the old condition only
+required `sshUser` to be non-empty — which a bundle site legitimately leaves out
+— so it skipped in silence and "full reset" reported success with k0s still
+running and `/data` intact on the machine.
 
-A single TLS port carries all edge ↔ management traffic. SNI on the
-nginx-ingress controller routes to the right backend.
+It requires you to type the site name, because it deletes `/data` — which holds
+the facility backup, the archive of record.
 
-| From | To | Port | Purpose | Encrypted? |
-|------|-----|------|---------|---|
-| Edge | Management | **443** | All edge traffic, SNI-routed: `seaweedfs.aisedge.local`, `k0s.aisedge.local`, `konnect.aisedge.local` | TLS — server cert signed by `ais-edge-ca` |
-| Management | XNAT | 443 | XNAT REST API uploads | HTTPS |
-| Management | Edge | 22 | SSH (initial setup only) | SSH |
+**It never deletes your age key or your site files.**
 
-All edge traffic is **outbound only** (zero inbound on edge VMs).
+A partial teardown is worse than none. A CRD without its operator, a namespace
+Helm cannot adopt, cert-manager RBAC from a release that no longer exists, or a
+stale `/etc/hosts` entry each make the *next* install fail in a way that looks
+like a bug in the charts.
 
-**Site IT firewall rule:** ALLOW outbound TCP from edge IP to management IP, dst-port 443.
+---
 
-Admin-only endpoints (SeaweedFS master/filer UIs, S3 admin) are now ClusterIP-only on the
-management cluster — reach them via `kubectl port-forward`. No external port required.
+## Pinned versions
+
+| Component | Version |
+|---|---|
+| k0s / k0smotron | `v1.35.2+k0s.0` / `v2.0.3` |
+| cert-manager | `v1.20.3` |
+| kube-prometheus-stack | `87.19.2` |
+| Loki | `7.1.0` (app 3.6.8) |
+| Vector | `0.57.0` |
+| ingress-nginx | `4.15.1` |
+| Orthanc | `1.12.11` |
+| xnat-ingest | `0.15.0` |
+
+Every one is what is **verified working**, read out of a live deployment rather
+than chosen from a changelog. The previous installer used `/latest/` and
+`/stable/` URLs, so a rebuild months apart got whatever upstream had published
+that morning. Upgrade them deliberately, one at a time.
+
+### Requirements
+
+* Ubuntu 22.04 on the management node and each edge
+* Key-based SSH from the management node to each edge — **only for `join: ssh`,
+  the default**. A site with no inbound path uses `join: bundle` and needs no
+  SSH at all (see **Edges** above, and `docs/TOUR.md` §4.1). Teardown of a
+  `join: bundle` site then has to be finished by hand on the edge.
+* `sops` and `age` on the management node
+* Ports: **443** inbound on the management node; **4242** (DICOM) on each edge
+  from its modalities; **22** inbound on each edge from the management node
+  **for `join: ssh` only**. In steady state — and always under `join: bundle` —
+  the edge only dials *out*, to the management node on 443, under either
+  `exposure` mode.
+* ~16Gi RAM on the management node supports roughly 15 edge sites
+
+## Stanford deployment
+
+Stanford/rsl60 now uses the consolidated Helm charts with site values in
+[`sites/stanford/`](sites/stanford/values.yaml) and
+[`sites/edge-rsl60/`](sites/edge-rsl60/values.yaml). The chart stages preserve
+external Orthanc ingestion, PatientID routing, Samba uploads, automatic XNAT
+project ownership, token refresh, and verified S3 archival. Follow the
+[rsl60 deployment runbook](docs/rsl60-existing-orthanc-deployment.md) to configure
+and adopt the existing deployment.

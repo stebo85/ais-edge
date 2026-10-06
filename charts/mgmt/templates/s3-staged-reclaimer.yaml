@@ -132,6 +132,8 @@ spec:
                   value: {{ $bucket | quote }}
                 - name: S3_PREFIX
                   value: {{ $root.Values.xnatUpload.prefix | quote }}
+                - name: ARCHIVE_PREFIX
+                  value: {{ $root.Values.xnatUpload.archivePrefix | quote }}
                 - name: RECLAIM
                   value: {{ $root.Values.dataPolicy.derived.s3Staged.reclaim | quote }}
                 - name: MIN_AGE

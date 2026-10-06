@@ -399,6 +399,18 @@ xnatUpload:
     tag: "0.15.6"
     pullPolicy: IfNotPresent
 
+  projectProvisioning:
+    enabled: false
+    sourceGroupOwner: true
+    ownerUsers: []
+    interval: 60
+  tokenRefresh:
+    enabled: false
+    sourceSecretRef: xnat-token-source
+    schedule: "0 */12 * * *"
+    # Empty uses the source Secret's server.
+    uploadServer: ""
+
   xnatSecretRef: xnat-credentials     # keys: server, username, password
   s3SecretRef: seaweedfs-upload       # keys: access-key, secret-key
 
@@ -406,6 +418,8 @@ xnatUpload:
   # edge against that site's own bucket. A single fleet-wide value would make
   # one uploader a fleet-wide single point of failure.
   prefix: staged
+  # Preserve verified uploads here before the reclaimer removes staged data.
+  archivePrefix: ""
   region: us-east-1
 
   loop: 60

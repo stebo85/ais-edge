@@ -132,6 +132,25 @@ http://{{ include "mgmt.fullname" . }}-seaweedfs.{{ .Release.Namespace }}.svc.cl
 {{/* Validation — all of these fail silently at runtime if wrong           */}}
 {{/* ===================================================================== */}}
 {{- define "mgmt.validate" -}}
+  {{- if .Values.xnatUpload.archivePrefix }}
+    {{- if or (not (regexMatch "^[A-Za-z0-9][A-Za-z0-9_-]*$" .Values.xnatUpload.archivePrefix)) (eq .Values.xnatUpload.archivePrefix .Values.xnatUpload.prefix) (eq .Values.xnatUpload.archivePrefix ".reclaim-state") }}
+      {{- fail "xnatUpload.archivePrefix must be a separate safe top-level prefix" }}
+    {{- end }}
+  {{- end }}
+  {{- if .Values.xnatUpload.tokenRefresh.enabled }}
+    {{- if not .Values.xnatUpload.tokenRefresh.sourceSecretRef }}
+      {{- fail "xnatUpload.tokenRefresh.sourceSecretRef must name the long-lived credential Secret" }}
+    {{- end }}
+    {{- if eq .Values.xnatUpload.tokenRefresh.sourceSecretRef .Values.xnatUpload.xnatSecretRef }}
+      {{- fail "token refresh source and target Secrets must differ" }}
+    {{- end }}
+    {{- if not .Values.edges }}
+      {{- fail "token refresh requires edges and their per-edge upload Deployments" }}
+    {{- end }}
+  {{- end }}
+  {{- if and .Values.xnatUpload.projectProvisioning.enabled (lt (int .Values.xnatUpload.projectProvisioning.interval) 1) }}
+    {{- fail "project provisioning interval must be positive" }}
+  {{- end }}
 
   {{- /* =====================================================================
          CLOUD TOPOLOGY: THE INGRESS MUST ASK FOR A LOAD BALANCER

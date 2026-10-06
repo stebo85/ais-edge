@@ -107,6 +107,10 @@ spec:
           env:
             - name: EDGE_NAME
               value: {{ .Values.clusterLabel | quote }}
+            - name: S3_TRANSFERS
+              value: {{ .Values.upload.s3.transfers | quote }}
+            - name: S3_BANDWIDTH_LIMIT
+              value: {{ .Values.upload.s3.bandwidthLimit | default "off" | quote }}
             - name: S3_BUCKET
               value: {{ include "edge.s3Bucket" . | quote }}
             - name: S3_PREFIX

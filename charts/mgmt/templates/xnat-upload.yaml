@@ -101,15 +101,71 @@ spec:
         # dashboards select component="upload" in namespace xnat-upload.
         # Renaming either disables them with no error anywhere.
         component: upload
+      {{- if $root.Values.xnatUpload.projectProvisioning.enabled }}
+      annotations:
+        checksum/project-provisioner: {{ printf "%s%s" (toJson $root.Values.xnatUpload.projectProvisioning) ($root.Files.Get "files/stanford-projects.py") | sha256sum }}
+        {{- with $root.Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- else }}
       {{- with $root.Values.podAnnotations }}
       annotations:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "mgmt.fullname" $root }}-xnat-upload
       automountServiceAccountToken: false
       {{- include "mgmt.schedulingRules" $root | nindent 6 }}
+      {{- if $root.Values.xnatUpload.projectProvisioning.enabled }}
+      volumes:
+        - name: project-provisioner
+          configMap:
+            name: {{ include "mgmt.fullname" $root }}-project-provisioner
+      {{- end }}
       containers:
+        {{- if $root.Values.xnatUpload.projectProvisioning.enabled }}
+        - name: project-provisioner
+          image: "{{ $root.Values.xnatUpload.image.repository }}:{{ $root.Values.xnatUpload.image.tag }}"
+          imagePullPolicy: {{ $root.Values.xnatUpload.image.pullPolicy }}
+          command: [python3, /etc/stanford/stanford-projects.py]
+          env:
+            - name: PROJECT_PROVISIONING
+              value: {{ toJson $root.Values.xnatUpload.projectProvisioning | quote }}
+            - name: S3_BUCKET
+              value: {{ $bucket | quote }}
+            - name: S3_PREFIX
+              value: {{ $root.Values.xnatUpload.prefix | quote }}
+            - name: WAIT_PERIOD
+              value: {{ $root.Values.xnatUpload.waitPeriod | quote }}
+            - name: PROVISION_INTERVAL
+              value: {{ $root.Values.xnatUpload.projectProvisioning.interval | quote }}
+            - name: XNAT_VERIFY_SSL
+              value: {{ $root.Values.xnatUpload.verifySsl | quote }}
+            - name: AWS_ENDPOINT_URL
+              value: {{ include "mgmt.s3InternalEndpoint" $root | quote }}
+            - name: AWS_DEFAULT_REGION
+              value: {{ $root.Values.xnatUpload.region | quote }}
+            {{- range $entry := list (dict "env" "XINGEST_HOST" "key" "server") (dict "env" "XINGEST_USER" "key" "username") (dict "env" "XINGEST_PASS" "key" "password") }}
+            - name: {{ $entry.env }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.xnatUpload.xnatSecretRef }}
+                  key: {{ $entry.key }}
+            {{- end }}
+            {{- range $entry := list (dict "env" "S3_ACCESS_KEY" "key" "access-key") (dict "env" "S3_SECRET_KEY" "key" "secret-key") }}
+            - name: {{ $entry.env }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $edge.uploadSecretRef | default $root.Values.xnatUpload.s3SecretRef }}
+                  key: {{ $entry.key }}
+            {{- end }}
+          volumeMounts:
+            - {name: project-provisioner, mountPath: /etc/stanford, readOnly: true}
+          resources:
+            requests: {memory: 128Mi, cpu: 50m}
+            limits: {memory: 512Mi, cpu: 500m}
+        {{- end }}
         - name: upload
           image: "{{ $root.Values.xnatUpload.image.repository }}:{{ $root.Values.xnatUpload.image.tag }}"
           imagePullPolicy: {{ $root.Values.xnatUpload.image.pullPolicy }}

@@ -1,0 +1,100 @@
+{{- if .Values.ingest.stanford.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "edge.fullname" . }}-stanford-ingest
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "edge.labels" . | nindent 4 }}
+data:
+  config.json: {{ toJson .Values.ingest.stanford | quote }}
+  stanford-ingest.py: |
+    {{- .Files.Get "files/stanford-ingest.py" | nindent 4 }}
+  stanford-stage-raw.py: |
+    {{- .Files.Get "files/stanford-stage-raw.py" | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "edge.fullname" . }}-stanford-ingest
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "edge.labels" . | nindent 4 }}
+    app: xnat-ingest
+    component: assign
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      component: assign
+  template:
+    metadata:
+      labels:
+        {{- include "edge.labels" . | nindent 8 }}
+        app: xnat-ingest
+        component: assign
+      annotations:
+        checksum/config: {{ printf "%s%s%s" (toJson .Values.ingest.stanford) (.Files.Get "files/stanford-ingest.py") (.Files.Get "files/stanford-stage-raw.py") | sha256sum }}
+    spec:
+      {{- include "edge.hostAliases" . | nindent 6 }}
+      {{- include "edge.schedulingRules" . | nindent 6 }}
+      automountServiceAccountToken: false
+      containers:
+        - name: ingest
+          image: "{{ .Values.ingest.image.repository }}:{{ .Values.ingest.image.tag }}"
+          imagePullPolicy: {{ .Values.ingest.image.pullPolicy }}
+          command: [python3, /etc/stanford/stanford-ingest.py]
+          env:
+            {{- include "edge.logEnv" . | nindent 12 }}
+            - name: INGEST_INTERVAL
+              value: {{ .Values.ingest.orthancGroup.interval | quote }}
+            - name: ORTHANC_GROUP_ENABLED
+              value: {{ .Values.ingest.orthancGroup.enabled | quote }}
+            - name: ORTHANC_URL
+              value: {{ include "edge.orthancUrl" . | quote }}
+            - name: ORTHANC_STORAGE_DIR
+              value: {{ .Values.orthanc.storageDirectory | quote }}
+            - name: ORTHANC_READY_LABEL
+              value: {{ .Values.ingest.orthancGroup.toProcessLabel | quote }}
+            - name: ORTHANC_PROCESSED_LABEL
+              value: {{ .Values.ingest.orthancGroup.processedLabel | quote }}
+            - name: ORTHANC_WAIT_PERIOD
+              value: {{ .Values.ingest.orthancGroup.waitPeriod | quote }}
+            - name: GROUPED_RECLAIM
+              value: {{ .Values.dataPolicy.derived.grouped.reclaim | quote }}
+            {{- if .Values.orthanc.auth.enabled }}
+            {{- range $entry := list (dict "env" "ORTHANC_USER" "key" "orthanc-user") (dict "env" "ORTHANC_PASSWORD" "key" "orthanc-password") }}
+            - name: {{ $entry.env }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.orthanc.auth.existingSecret }}
+                  key: {{ $entry.key }}
+            {{- end }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.upload.direct.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "edge.pipelineVolumeMount" . | nindent 12 }}
+            - {name: stanford, mountPath: /etc/stanford, readOnly: true}
+            {{- if .Values.ingest.stanford.rawUploads.enabled }}
+            - {name: raw-upload, mountPath: /stanford-upload}
+            - {name: raw-archive, mountPath: /stanford-upload-done}
+            {{- end }}
+      volumes:
+        {{- include "edge.pipelineVolume" . | nindent 8 }}
+        - name: stanford
+          configMap:
+            name: {{ include "edge.fullname" . }}-stanford-ingest
+        {{- if .Values.ingest.stanford.rawUploads.enabled }}
+        - name: raw-upload
+          hostPath:
+            path: {{ .Values.ingest.stanford.rawUploads.hostPath | quote }}
+            type: Directory
+        - name: raw-archive
+          hostPath:
+            path: {{ .Values.ingest.stanford.rawUploads.archiveHostPath | quote }}
+            type: Directory
+        {{- end }}
+{{- end }}

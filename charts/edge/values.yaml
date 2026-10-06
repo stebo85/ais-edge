@@ -505,6 +505,10 @@ storage:
 # 3. orthanc — DICOM receiver + de-identification
 # =============================================================================
 orthanc:
+  enabled: true
+  # Disable the managed receiver to use an existing facility Orthanc.
+  externalUrl: ""
+  storageDirectory: /data/orthanc-storage
   image:
     repository: jodogne/orthanc-plugins
     tag: "1.12.11"
@@ -642,6 +646,31 @@ ingest:
     repository: ghcr.io/australian-imaging-service/xnat-ingest
     tag: "0.15.6"
     pullPolicy: IfNotPresent
+
+  # Stanford routing and raw-file ingestion use the current xnat-ingest image.
+  stanford:
+    enabled: false
+    fallbackProject: misc
+    routing:
+      enabled: true
+      field: PatientID
+      visitFields: [AccessionNumber, StudyID, StudyInstanceUID]
+      autoImportUnlabeled: false
+      requireMatch: false
+      batchSize: 10
+      allowedProjects: []
+    rawUploads:
+      enabled: false
+      hostPath: /local/samba/public/xnat-upload
+      archiveHostPath: /local/samba/public/xnat-upload-done
+      waitPeriod: 60
+      visit: samba_upload
+      scan: 1.SambaUpload
+      resource: FILES
+      modality: MR
+      # Empty admits every raw project independently of the DICOM allow-list.
+      allowedProjects: []
+    excludeDicomScanTypes: [PhoenixZIPReport]
 
   # One JSON object per log line. The alert rules and dashboards parse these
   # fields directly; turning this off breaks monitoring, not just formatting.
@@ -939,6 +968,8 @@ upload:
         repository: amazon/aws-cli
         tag: "2.31.19"
         pullPolicy: IfNotPresent
+    transfers: 4
+    bandwidthLimit: ""
     interval: 60
     # Don't touch a session until it has been quiet this long — assign may
     # still be writing into it.

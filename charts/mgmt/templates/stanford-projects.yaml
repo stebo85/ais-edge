@@ -1,0 +1,12 @@
+{{- if and .Values.xnatUpload.enabled .Values.xnatUpload.projectProvisioning.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "mgmt.fullname" . }}-project-provisioner
+  namespace: {{ .Values.xnatUpload.namespace }}
+  labels:
+    {{- include "mgmt.labels" . | nindent 4 }}
+data:
+  stanford-projects.py: |
+    {{- .Files.Get "files/stanford-projects.py" | nindent 4 }}
+{{- end }}

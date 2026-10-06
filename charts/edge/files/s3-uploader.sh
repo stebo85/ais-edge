@@ -290,7 +290,7 @@ while true; do
         # A dangling link under --copy-links is a hard error (exit 6, measured),
         # which lands in the else branch — no state file, no reclaim.
         if rclone copy "$session_dir" "sw:${S3_BUCKET}/${S3_PREFIX}/${session_name}/" \
-             --copy-links --transfers 4 --checkers 8 --retries 3 --log-level ERROR; then
+             --copy-links --transfers "${S3_TRANSFERS:-4}" --bwlimit "${S3_BANDWIDTH_LIMIT:-off}" --checkers 8 --retries 3 --log-level ERROR; then
             duration=$(( $(date +%s) - start_ts ))
             jlog upload_completed "$session_name" "" \
                 ",\"bytes\":${bytes},\"files\":${files},\"dicoms\":${dicoms},\"duration_s\":${duration}"

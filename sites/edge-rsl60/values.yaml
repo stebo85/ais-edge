@@ -1,0 +1,55 @@
+clusterLabel: edge-rsl60
+namespace: xnat-ingest
+topology: onprem
+deid:
+  engine: none
+  # This site's DICOMs are de-identified before reaching its existing Orthanc.
+  policyReviewed: true
+storage:
+  pipeline:
+    hostPath: /local/orthanc
+  facilityBackup:
+    enabled: false
+orthanc:
+  enabled: false
+  externalUrl: http://REPLACE_WITH_ORTHANC_HOST:8042
+  storageDirectory: /data/db-v6
+  auth:
+    enabled: true
+    existingSecret: orthanc-credentials
+ingest:
+  orthancGroup:
+    processedLabel: xnat-ingest-skip
+  stanford:
+    enabled: true
+    fallbackProject: misc
+    routing:
+      enabled: true
+      autoImportUnlabeled: true
+      requireMatch: false
+      allowedProjects: []
+    rawUploads:
+      enabled: true
+      hostPath: /local/samba/public/xnat-upload
+      archiveHostPath: /local/samba/public/xnat-upload-done
+      allowedProjects: []
+upload:
+  mode: s3
+  s3:
+    bucket: ingest-bucket
+    transfers: 2
+    bandwidthLimit: 80M
+observability:
+  enabled: true
+dataPolicy:
+  enabled: true
+  dryRun: false
+  originals:
+    facilityBackup:
+      enabled: false
+  derived:
+    orthancStorage:
+      location: /data/db-v6
+      reclaim: never
+    assigned:
+      minAge: 5m

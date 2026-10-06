@@ -126,6 +126,7 @@ BUNDLE_TARGET_IP=$(printf '%q' "${NODE_IP:-}")
 BUNDLE_EXPIRES_AT=$(printf '%q' "$EXPIRES_AT")
 BUNDLE_SHA256=$(printf '%q' "$PAYLOAD_SHA")
 
+export EDGE_K0S_DATA_DIR=$(printf '%q' "${EDGE_K0S_DATA_DIR:-/var/lib/k0s}")
 export EDGE_NAME=$(printf '%q' "$CLUSTER_NAME")
 export MGMT_NODE_IP=$(printf '%q' "${MGMT_NODE_IP:-}")
 export SEAWEEDFS_HOSTNAME=$(printf '%q' "${SEAWEEDFS_HOSTNAME:-}")

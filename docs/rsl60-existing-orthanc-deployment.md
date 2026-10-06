@@ -1,157 +1,121 @@
-# rsl60 Deployment With Existing Orthanc
+# Stanford/rsl60 deployment with the Helm charts
 
-This runbook is for the XNAT-host deployment shape:
+Stanford now uses `charts/mgmt` and `charts/edge`, configured by
+`sites/stanford/values.yaml` and `sites/edge-rsl60/values.yaml`. The pipeline
+uses upstream `xnat-ingest:0.15.6`; the old fork's routing and project
+provisioning are chart-mounted Python stages.
 
-- The XNAT server's existing `k3s` cluster is the AIS Edge management cluster.
-- `rsl60` is the facility edge worker, but it is behind a firewall and cannot be reached by SSH from the XNAT host.
-- Orthanc is already running on `rsl60`, so AIS Edge must not deploy its own Orthanc pod or bind port `4242`.
+The Stanford values retain the existing Orthanc store under `/local/orthanc/db-v6`,
+Samba shares under `/local/samba/public/`, staging bucket `ingest-bucket`,
+control-plane NodePorts 30443/30132, and worker runtime under `/data/k0s`.
+Addresses and credentials remain placeholders; fill them from the existing
+configuration before installing. Preserve the existing S3 keys and CA when
+adopting a running deployment.
 
-## Configuration
+## Configure and review
 
-Use these settings in `config/management.env`:
+1. Edit `sites/stanford/values.yaml`: management/edge IPs, domain/hostnames,
+   SMTP settings, and the existing cluster exposure. `edges[].join: bundle`
+   uses the upstream carry-over bootstrap without SSH into rsl60.
+2. Edit `sites/edge-rsl60/values.yaml`: external Orthanc URL and the relevant
+   storage/share paths. Authentication comes from the `orthanc-credentials`
+   Secret, with `orthanc-user` and `orthanc-password`; leave credentials out of
+   URLs and values files. Set `orthanc.auth.enabled: false` if the existing API
+   does not require authentication.
+3. Copy each site's `secrets.example.yaml` to `secrets.enc.yaml`, fill its
+   placeholders, then encrypt with `scripts/site-secrets.sh encrypt <site>`.
+   Management credentials and edge credentials go to their respective clusters.
+   The `xnat-token-source` Secret holds long-lived credentials that can issue
+   aliases and manage XNAT projects. `xnat-credentials` is the upload token
+   target and must already exist before the refresh job patches it.
+4. Review the existing-resource adoption process in
+   [`scripts/adopt-existing.sh`](../scripts/adopt-existing.sh). The chart introduces release-owned
+   workload names. Stop the old `xnat-ingest-sort` and `xnat-ingest-upload`
+   workloads before enabling their replacements, so two pipelines do not read
+   the same Orthanc or bucket concurrently. Preserve queued data and storage.
 
-```bash
-export INSTALL_MODE="existing"
-export INSTALL_TOPOLOGY="cloud"
-export CLOUD_PROVIDER="none"
-```
+Stanford receives DICOM data de-identified upstream, so its values select
+`deid.engine: none`. The external receiver and its storage are kept outside
+Helm; no managed Orthanc pod, DICOM port binding, salt, or Lua de-identification
+hook is installed. Keep Orthanc storage and the pipeline on the same filesystem.
+Prepare both Samba host directories on rsl60 before installation; their mounts
+require existing directories rather than silently creating a mistyped path.
 
-Use these settings in `config/edge-nodes.env`:
+## Routing and file pickup
 
-```bash
-EDGE_NODES=(
-  "edge-rsl60|rsl60|ubuntu||<XNAT_PROJECT>|<RSL60_S3_ACCESS_KEY>|<RSL60_S3_SECRET_KEY>"
-)
+`PatientID=subject@group/project` routes to `project.subject.visit`, carrying
+`SourceGroup=group` for ownership. The visit comes from the first nonempty
+`AccessionNumber`, `StudyID`, or `StudyInstanceUID`. Other studies go to the
+configured `fallbackProject` (`misc`). Stable unlabeled studies are admitted
+in bounded batches; ready/processed labels remain `xnat-ingest-ready` and
+`xnat-ingest-skip`.
 
-export EDGE_JOIN_MODE="manual"
-export AIS_EDGE_NO_SSH="1"
-export EDGE_ORTHANC_MODE="external"
-export EDGE_ORTHANC_URL="http://<rsl60-orthanc-api-host-or-ip>:8042"
-export EDGE_DATA_HOST_PATH="/local/orthanc"
-export EDGE_ORTHANC_STORAGE_HOST_PATH="/local/orthanc/db-v6"
-export EDGE_ORTHANC_STORAGE_DIR="/data/db-v6"
-export EDGE_K0S_DATA_DIR="/data/k0s"
-export EDGE_SAMBA_UPLOAD_ENABLED="1"
-export EDGE_SAMBA_UPLOAD_HOST_PATH="/local/samba/public/xnat-upload"
-export EDGE_SAMBA_UPLOAD_ARCHIVE_HOST_PATH="/local/samba/public/xnat-upload-done"
-export EDGE_SAMBA_UPLOAD_VISIT="samba_upload"
-```
+Raw data uses `<group>/<project>/<subject>/`, for example
+`polimeni/openrecon/test/`. After the quiet period it becomes
+`openrecon.test.samba_upload/1.SambaUpload/FILES/`, with modern
+`__METADATA__.json` and `__MANIFEST__.json`. Pickup retains the group/project
+folders and copies the originals to the `xnat-upload-done` archive before
+publishing the session. Interrupted claimed sources are restored for retry.
 
-The existing Orthanc storage must be visible to the sort pod at
-`EDGE_ORTHANC_STORAGE_DIR`.
+An empty raw `allowedProjects` list admits every project independently of the
+DICOM list. A nonempty list is extended by projects observed on the routed
+DICOM path. Empty folders do not trigger staging or project creation.
+`PhoenixZIPReport` DICOM resources are excluded from the assigned copy; the
+external Orthanc original remains available.
 
-Keep staging and Orthanc storage on the same filesystem. `xnat-ingest sort`
-hardlinks from Orthanc storage into staging, and cross-filesystem hardlinks
-fail with `EXDEV`.
+The per-edge management uploader has a project-provisioner sidecar. It creates
+projects for settled sessions, assigns the existing `SourceGroup` user as Owner,
+and verifies membership. Unknown users are logged as deferred; no accounts are
+created. `brosnan` and `sciget` are synchronized as Owners across existing and
+new projects. Alias credentials refresh every 12 hours and the job rolls the
+per-edge uploaders; `install.sh` runs the first refresh immediately.
 
-On the current rsl60 host, Orthanc stores DICOM data under
-`/local/orthanc/db-v6`, while `/data` is a separate filesystem. Use
-`/local/orthanc` as `EDGE_DATA_HOST_PATH`; the sort pod will mount that host
-directory as `/data`, see Orthanc storage at `/data/db-v6`, and create AIS
-staging at `/data/staging` (`/local/orthanc/staging` on the host). Use
-`/data/k0s` only for k0s/container runtime state.
+## Upload and archival
 
-With `EDGE_SAMBA_UPLOAD_ENABLED=1`, the sort pod also scans
-`/local/samba/public/xnat-upload` on rsl60. The expected layout is:
+The edge uses upstream's rclone uploader with two transfers and an 80 MiB/s
+bandwidth limit. Management waits 300 seconds for S3 writes to settle.
+The verified reclaimer checks XNAT delivery, then copies the session to
+`uploaded/<UTC timestamp>/<session>/`. It compares archive paths and byte sizes,
+and confirms that the staged object listing did not change during copying,
+before removing staging through the filer. A failed copy or verification keeps
+the staged source. Existing upstream dry-run, age, and removal limits still apply.
+The raw share and its archive are reported as original stages with permanent
+retention; Orthanc store reclamation is disabled for this site.
 
-```text
-/local/samba/public/xnat-upload/<group>/<project>/<subject>/
-```
+## Install and check
 
-For example, files dropped under
-`/local/samba/public/xnat-upload/polimeni/openrecon/test/` are staged as the
-XNAT session `openrecon.test.samba_upload`, so the management upload pod
-imports them into the `openrecon` project for subject `test`. The files are
-placed under scan `1.SambaUpload`, resource `FILES`. After pickup, the
-original subject directory is moved out of the upload share and archived under
-`/local/samba/public/xnat-upload-done/polimeni/openrecon/test/`; the now-empty
-`<group>/<project>` directories are left in place in the upload share so the
-drop-off folder structure stays put.
-
-rsl60 sets `EDGE_SAMBA_UPLOAD_ALLOWED_PROJECTS=""`, admitting every new raw
-project without a DICOM study or a manual allow-list change. After the normal
-quiet period, `<group>/<project>/<subject>/` is staged, the central provisioner
-creates the project, and the existing XNAT user matching `<group>` is requested
-and verified as an Owner using `SourceGroup` metadata. Unknown users are logged
-as deferred; this does not create user accounts. An empty folder alone does not
-trigger an upload or project creation.
-
-To restrict admission, configure a nonempty comma-separated raw project list.
-Routed Orthanc projects extend that list and are cached on the edge. An explicitly
-empty value must remain empty during deployment; only an unset variable inherits
-`EDGE_AUTO_IMPORT_ALLOWED_PROJECTS`.
-
-If the existing Orthanc REST API requires HTTP Basic Auth, include credentials
-in `EDGE_ORTHANC_URL` using a secret-managed config file on the management
-host, for example `http://<user>:<pass>@<rsl60-host>:8042`.
-
-## Management-Side Steps
-
-Run from the XNAT host with `kubectl` pointed at the existing k3s cluster.
-On this host that may mean:
+With kubectl pointed at the existing management cluster:
 
 ```bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+./install.sh stanford
 ```
 
-Then:
+Carry `edge-rsl60-join.sh` to rsl60 when prompted and run it there. Existing
+joined workers are retained. `workerDataDir` is an install-time choice; changing
+it does not relocate a running worker's runtime. For an explicit runtime reset,
+the existing reset script accepts `EDGE_K0S_DATA_DIR=/data/k0s`; review its dry
+run before using its execution flag.
+
+Render without applying:
 
 ```bash
-bash scripts/01-install-k0s.sh
-bash scripts/02-install-k0smotron.sh
-bash scripts/02b-bootstrap-ca.sh
-# Review ingress-nginx carefully before this step on the XNAT host.
-bash scripts/02c-install-nginx-ingress.sh
-bash scripts/03-deploy-seaweedfs.sh
-bash scripts/04-deploy-xnat-upload.sh
-
-entry='edge-rsl60|rsl60|ubuntu||<XNAT_PROJECT>|<RSL60_S3_ACCESS_KEY>|<RSL60_S3_SECRET_KEY>'
-bash scripts/05-setup-edge-cluster.sh "$entry"
-bash scripts/06a-create-edge-bootstrap-bundle.sh "$entry"
+helm template mgmt charts/mgmt -n ais-mgmt -f sites/stanford/values.yaml
+helm template edge charts/edge -n xnat-ingest \
+  -f sites/stanford/values.yaml -f sites/edge-rsl60/values.yaml
+make stanford
 ```
 
-Transfer `secrets/edge-bootstrap-edge-rsl60.tar.gz` to `rsl60` using a
-facility-approved path.
-
-## rsl60 Local Step
-
-Run locally on `rsl60`:
+Runtime checks:
 
 ```bash
-tar xzf edge-bootstrap-edge-rsl60.tar.gz
-cd edge-bootstrap-edge-rsl60
-./bootstrap-rsl60.sh
+KUBECONFIG=kubeconfig-edge-rsl60 kubectl -n xnat-ingest logs deploy/edge-stanford-ingest
+KUBECONFIG=kubeconfig-edge-rsl60 kubectl -n xnat-ingest logs deploy/edge-s3-uploader
+kubectl -n xnat-upload logs deploy/mgmt-upload-edge-rsl60 -c project-provisioner
+kubectl -n xnat-upload logs deploy/mgmt-upload-edge-rsl60 -c upload
 ```
 
-This installs the k0s worker, joins it to the hosted control plane, prepares
-staging directories, and leaves the existing Orthanc service untouched.
-
-## Finish From XNAT Host
-
-After the local bootstrap:
-
-```bash
-KUBECONFIG=kubeconfig-edge-rsl60 kubectl get nodes -o wide
-AIS_EDGE_NO_SSH=1 bash scripts/07-deploy-edge-ingest.sh "$entry"
-AIS_EDGE_NO_SSH=1 bash scripts/07b-deploy-edge-observability.sh "$entry"  # optional
-bash scripts/07c-deploy-edge-orthanc.sh "$entry"  # should print SKIPPED
-```
-
-Check:
-
-```bash
-KUBECONFIG=kubeconfig-edge-rsl60 kubectl get pods -n xnat-ingest -o wide
-KUBECONFIG=kubeconfig-edge-rsl60 kubectl logs -n xnat-ingest -l component=sort -f
-KUBECONFIG=kubeconfig-edge-rsl60 kubectl logs -n xnat-ingest -l component=s3-uploader -f
-kubectl logs -n xnat-upload -l component=upload -f
-```
-
-## Orthanc Requirements
-
-The existing Orthanc must provide:
-
-- An HTTP API reachable from the sort pod at `EDGE_ORTHANC_URL`.
-- Storage readable from the k0s worker host path configured by `EDGE_ORTHANC_STORAGE_HOST_PATH`.
-- The expected labels `xnat-ingest-ready` and `xnat-ingest-skip`, unless the
-  sort command is deliberately reconfigured after confirming unlabeled polling
-  is safe for that Orthanc instance.
+The local regression tests exercise routing, quiet periods, folder retention,
+archive failure recovery, Owner verification, and copy-before-delete behavior.
+The runtime test uses the pinned image to prove that real session loading and
+assignment accept the migrated metadata; it can also run through
+`XNAT_RUNTIME_PYTHON` pointing at a release-0.15.6 virtual environment.

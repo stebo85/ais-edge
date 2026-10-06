@@ -46,6 +46,7 @@ set -euo pipefail
 
 STAGE="${AIS_STAGE_DIR:-/tmp}"
 TOPOLOGY="${INSTALL_TOPOLOGY:-onprem}"
+WORKER_DATA_DIR="${EDGE_K0S_DATA_DIR:-/var/lib/k0s}"
 
 step() { printf '  [%s/6] %-34s ' "$1" "$2"; }
 ok()   { printf 'ok%s\n' "${1:+ ($1)}"; }
@@ -70,6 +71,11 @@ done
 for v in MGMT_NODE_IP K0S_API_HOSTNAME; do
     [ -n "${!v:-}" ] || die "${v} is not set"
 done
+case "$WORKER_DATA_DIR" in
+    /*) ;;
+    *) die "EDGE_K0S_DATA_DIR must be absolute" ;;
+esac
+[ "$WORKER_DATA_DIR" != / ] || die "EDGE_K0S_DATA_DIR cannot be /"
 ok "root, 3 staged files"
 
 # -----------------------------------------------------------------------------
@@ -137,7 +143,7 @@ is_already_joined() {
     [ "${NODE_JOINED:-}" = "true" ] && return 0
     [ -n "${NODE_JOINED:-}" ] && return 1          # management side said false
     $SUDO systemctl is-active k0sworker >/dev/null 2>&1 || return 1
-    local cert=/var/lib/k0s/kubelet/pki/kubelet-client-current.pem
+    local cert="${WORKER_DATA_DIR}/kubelet/pki/kubelet-client-current.pem"
     $SUDO test -f "$cert" || return 1
     command -v curl >/dev/null 2>&1 || return 1
     local c
@@ -212,7 +218,7 @@ if [ "$JOINED" != "true" ]; then
         # because refusing to join is worse than joining with a caveat.
         command -v k0s >/dev/null 2>&1 || { curl -sSLf https://get.k0s.sh | $SUDO sh >/dev/null; }
     fi
-    $SUDO mkdir -p /etc/k0s
+    $SUDO mkdir -p /etc/k0s "$WORKER_DATA_DIR"
     $SUDO install -m 0600 "${STAGE}/join-token" /etc/k0s/join-token
     # Clear stale worker state before re-joining, or the cached kubelet identity
     # above survives the reinstall and keeps being refused. Only reached when the
@@ -220,7 +226,7 @@ if [ "$JOINED" != "true" ]; then
     if $SUDO systemctl is-active k0sworker >/dev/null 2>&1; then
         printf '\n      worker active but not joined — resetting first\n      '
         $SUDO k0s stop 2>/dev/null || true
-        $SUDO k0s reset 2>/dev/null || true
+        $SUDO k0s reset --data-dir "$WORKER_DATA_DIR" 2>/dev/null || true
     fi
     # Capture rather than stream. `--force` logs
     #   level=warning msg="failed to uninstall service: exit status 1"
@@ -228,7 +234,8 @@ if [ "$JOINED" != "true" ]; then
     # a first join. Printed live it lands in the middle of this step's status
     # line and reads as a failure to an operator who has no other feedback.
     # Real failures still surface: the output is replayed on a non-zero exit.
-    if ! install_out=$($SUDO k0s install worker --force --token-file /etc/k0s/join-token \
+    if ! install_out=$($SUDO k0s install worker --force --data-dir "$WORKER_DATA_DIR" \
+            --kubelet-root-dir "${WORKER_DATA_DIR}/kubelet" --token-file /etc/k0s/join-token \
             --kubelet-extra-args="${KUBELET_EXTRA_ARGS:---container-log-max-size=10Mi --container-log-max-files=5}" 2>&1); then
         printf '\n'
         printf '%s\n' "$install_out" >&2

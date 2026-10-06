@@ -788,8 +788,53 @@ print("%d %d" % (c, b))
 #
 # Echoes "HTTP <code>" plus any body, and returns non-zero on a non-2xx, so
 # the caller can log what actually happened rather than assuming success.
+# Copy every object (including metadata) before removing a verified session.
+# A failed copy, incomplete archive or source changed during copying keeps staging.
+archive_session() {
+    local session="$1" before after archived dest scratch
+    case "$ARCHIVE_PREFIX" in
+        *[!A-Za-z0-9._-]*|.*|-*|__*) echo "unsafe archive prefix"; return 1 ;;
+    esac
+    if [ "$ARCHIVE_PREFIX" = "$S3_PREFIX" ] || [ "$ARCHIVE_PREFIX" = "$STATE_PREFIX" ]; then
+        echo "archive prefix overlaps staging or state"; return 1
+    fi
+    dest="${ARCHIVE_PREFIX}/$(date -u +%Y%m%dT%H%M%SZ)/${session}/"
+    scratch=$(mktemp -d) || return 1
+    if ! aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "${S3_PREFIX}/${session}/" --output json > "$scratch/before.json"; then
+        rm -rf "$scratch"; echo "archive source listing failed"; return 1
+    fi
+    if ! aws s3 cp "s3://${S3_BUCKET}/${S3_PREFIX}/${session}/" "s3://${S3_BUCKET}/${dest}" --recursive --no-progress --only-show-errors; then
+        rm -rf "$scratch"; echo "archive copy failed; staged source retained"; return 1
+    fi
+    if ! aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "${S3_PREFIX}/${session}/" --output json > "$scratch/after.json" ||
+       ! aws s3api list-objects-v2 --bucket "$S3_BUCKET" --prefix "$dest" --output json > "$scratch/archive.json"; then
+        rm -rf "$scratch"; echo "archive verification listing failed"; return 1
+    fi
+    if ! python3 - "$scratch" "${S3_PREFIX}/${session}/" "$dest" <<'ARCHIVE_CHECK'
+import json, pathlib, sys
+scratch, source, dest = sys.argv[1:]
+def objects(name, prefix):
+    payload = json.loads((pathlib.Path(scratch) / name).read_text())
+    return {obj["Key"][len(prefix):]: (obj["Size"], obj.get("ETag"), obj.get("LastModified"))
+            for obj in payload.get("Contents", []) if not obj["Key"].endswith("/")}
+before = objects("before.json", source)
+after = objects("after.json", source)
+archive = objects("archive.json", dest)
+assert before == after, "source changed during archival"
+assert {key: value[0] for key, value in before.items()} == {key: value[0] for key, value in archive.items()}, "archive paths or bytes differ"
+ARCHIVE_CHECK
+    then
+        rm -rf "$scratch"; echo "archive verification failed; staged source retained"; return 1
+    fi
+    rm -rf "$scratch"
+    jlog reclaim_archived "$session" "copied verified session to ${dest}" >&2
+}
+
 filer_rm() {
     local session="$1" url body code
+    if [ -n "${ARCHIVE_PREFIX:-}" ]; then
+        archive_session "$session" || return 1
+    fi
     url="${FILER_ENDPOINT%/}/buckets/${S3_BUCKET}/${S3_PREFIX}/${session}?recursive=true"
     body=$(timeout "$HTTP_TIMEOUT" curl -sS -X DELETE -w '\n%{http_code}' "$url" 2>&1) || {
         printf 'request failed: %s' "$(printf '%s' "$body" | tr '\n' ' ')"

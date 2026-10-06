@@ -1234,8 +1234,88 @@ ingest:
       session: AccessionNumber
 EOF
 
+cat >"$V/edge-stanford.yaml" <<'EOF'
+deid: {engine: none, policyReviewed: true}
+storage: {facilityBackup: {enabled: false}}
+orthanc: {enabled: false, externalUrl: "http://orthanc.example.invalid:8042", storageDirectory: /data/db-v6}
+ingest:
+  stanford:
+    enabled: true
+    routing: {autoImportUnlabeled: true}
+    rawUploads: {enabled: true}
+dataPolicy:
+  originals: {facilityBackup: {enabled: false}}
+  derived: {orthancStorage: {location: /data/db-v6}}
+EOF
+
+cat >"$V/mgmt-stanford.yaml" <<'EOF'
+xnatUpload:
+  projectProvisioning: {enabled: true, ownerUsers: [brosnan, sciget]}
+  tokenRefresh: {enabled: true}
+  archivePrefix: uploaded
+EOF
+
+cat >"$V/neg-edge-external-url.yaml" <<'EOF'
+orthanc: {externalUrl: ""}
+EOF
+
+cat >"$V/neg-edge-external-engine.yaml" <<'EOF'
+deid: {engine: orthanc}
+EOF
+
+cat >"$V/neg-edge-stanford-engine.yaml" <<'EOF'
+deid: {engine: ingest}
+orthanc: {enabled: true}
+EOF
+
+cat >"$V/neg-edge-stanford-filedrop.yaml" <<'EOF'
+ingest: {fileDrop: {enabled: true}}
+EOF
+
+cat >"$V/neg-edge-stanford-project.yaml" <<'EOF'
+ingest: {stanford: {fallbackProject: "bad/project"}}
+EOF
+
+cat >"$V/neg-edge-stanford-batch.yaml" <<'EOF'
+ingest: {stanford: {routing: {batchSize: 0}}}
+EOF
+
+cat >"$V/neg-edge-stanford-paths.yaml" <<'EOF'
+ingest: {stanford: {rawUploads: {archiveHostPath: /local/samba/public/xnat-upload}}}
+EOF
+
+cat >"$V/neg-edge-stanford-scan.yaml" <<'EOF'
+ingest: {stanford: {rawUploads: {scan: ../escape}}}
+EOF
+
+cat >"$V/neg-edge-stanford-wait.yaml" <<'EOF'
+ingest: {stanford: {rawUploads: {waitPeriod: -1}}}
+EOF
+
+cat >"$V/neg-mgmt-archive-prefix.yaml" <<'EOF'
+xnatUpload: {archivePrefix: staged}
+EOF
+
+cat >"$V/neg-mgmt-token-source.yaml" <<'EOF'
+xnatUpload: {tokenRefresh: {sourceSecretRef: ""}}
+EOF
+
+cat >"$V/neg-mgmt-token-shared.yaml" <<'EOF'
+xnatUpload: {tokenRefresh: {sourceSecretRef: xnat-credentials}}
+EOF
+
+cat >"$V/neg-mgmt-token-no-edges.yaml" <<'EOF'
+edges: []
+EOF
+
+cat >"$V/neg-mgmt-project-interval.yaml" <<'EOF'
+xnatUpload: {projectProvisioning: {interval: 0}}
+EOF
+
 ci_positive_cases() {
   cat <<'EOF'
+edge-stanford	charts/edge	edge-base.yaml edge-stanford.yaml
+mgmt-stanford	charts/mgmt	mgmt-base.yaml mgmt-stanford.yaml
 mgmt-defaults	charts/mgmt	mgmt-base.yaml
 mgmt-k0smotron-external	charts/mgmt	mgmt-base.yaml mgmt-k0smotron-external.yaml
 mgmt-two-edges	charts/mgmt	mgmt-base.yaml mgmt-two-edges.yaml
@@ -1280,6 +1360,20 @@ EOF
 
 ci_negative_cases() {
   cat <<'EOF'
+neg-edge-external-url	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-external-url.yaml	requires orthanc.externalUrl
+neg-edge-external-engine	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-external-engine.yaml	external Orthanc requires
+neg-edge-stanford-engine	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-stanford-engine.yaml	ingest.stanford.enabled requires
+neg-edge-stanford-filedrop	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-stanford-filedrop.yaml	cannot run alongside
+neg-edge-stanford-project	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-stanford-project.yaml	fallbackProject must be
+neg-edge-stanford-batch	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-stanford-batch.yaml	batchSize must be positive
+neg-edge-stanford-paths	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-stanford-paths.yaml	distinct absolute
+neg-edge-stanford-scan	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-stanford-scan.yaml	single safe directory
+neg-edge-stanford-wait	charts/edge	edge-base.yaml edge-stanford.yaml neg-edge-stanford-wait.yaml	waitPeriod cannot be negative
+neg-mgmt-archive-prefix	charts/mgmt	mgmt-base.yaml mgmt-stanford.yaml neg-mgmt-archive-prefix.yaml	separate safe top-level
+neg-mgmt-token-source	charts/mgmt	mgmt-base.yaml mgmt-stanford.yaml neg-mgmt-token-source.yaml	sourceSecretRef must name
+neg-mgmt-token-shared	charts/mgmt	mgmt-base.yaml mgmt-stanford.yaml neg-mgmt-token-shared.yaml	source and target Secrets must differ
+neg-mgmt-token-no-edges	charts/mgmt	mgmt-base.yaml mgmt-stanford.yaml neg-mgmt-token-no-edges.yaml	token refresh requires edges
+neg-mgmt-project-interval	charts/mgmt	mgmt-base.yaml mgmt-stanford.yaml neg-mgmt-project-interval.yaml	provisioning interval must be positive
 neg-edge-assign-tag-crossed	charts/edge	edge-base.yaml neg-edge-assign-tag-crossed.yaml	crosses the de-identification
 neg-mgmt-no-domain	charts/mgmt	mgmt-base.yaml neg-mgmt-no-domain.yaml	domain.internal must be set
 neg-mgmt-no-nodeip	charts/mgmt	mgmt-base.yaml neg-mgmt-no-nodeip.yaml	domain.mgmtNodeIP must be set
